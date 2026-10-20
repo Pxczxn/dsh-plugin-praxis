@@ -1,8 +1,10 @@
 // CONTRACT §2: init, transactions, the cross-process lock, atomic writes and
 // the version/corruption refusals. Every case gets its own data directory.
 
-import { test } from 'node:test'
+import { mock, test } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
+import { promises as fsNs } from 'node:fs'
 import { chmod, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -349,4 +351,76 @@ test('emptyState hands out fresh collections on every call', () => {
   first.tasks.push({ id: 'x' })
   assert.deepEqual(emptyState().tasks, [])
   assert.equal(emptyState().version, STATE_VERSION)
+})
+
+test('替换失败时旧状态留在原位，不会出现没有状态文件的窗口', async () => {
+  const { dir, store, cleanup } = await scratch()
+  try {
+    await store.mutate(state => { state.observations.push({ id: 'obs-keep' }) })
+    const statePath = join(dir, 'state.json')
+    const before = await readFile(statePath, 'utf8')
+
+    // 模拟「目标被占用、rename 无法覆盖」：tmp -> state.json 必定失败。
+    const original = fsNs.rename
+    const patched = mock.method(fsNs, 'rename', async (from, to) => {
+      if (to === statePath && String(from).includes('.tmp-')) {
+        const error = new Error('EPERM: target busy')
+        error.code = 'EPERM'
+        throw error
+      }
+      return original(from, to)
+    })
+    try {
+      await assert.rejects(
+        store.mutate(state => { state.observations.push({ id: 'obs-new' }) }),
+        /atomic replace failed/,
+      )
+    } finally {
+      patched.mock.restore()
+    }
+
+    assert.equal(await readFile(statePath, 'utf8'), before, '旧状态必须逐字不变')
+    const entries = await readdir(dir)
+    assert.equal(entries.some(name => name.endsWith('.bak')), false, '失败后不能留下备份文件')
+    assert.equal(entries.some(name => name.includes('.tmp-')), true, '完整的新状态应保留在临时文件里')
+
+    const reloaded = await createStore({ dir }).load()
+    assert.deepEqual(reloaded.observations.map(item => item.id), ['obs-keep'])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('state.json 缺失但备份完整时恢复历史，而不是当成空状态', async () => {
+  const { dir, store, cleanup } = await scratch()
+  try {
+    await store.mutate(state => { state.observations.push({ id: 'obs-keep' }) })
+    const statePath = join(dir, 'state.json')
+    // 崩溃窗口：旧文件已挪到备份位，新文件还没就位。
+    await fsNs.rename(statePath, `${statePath}.bak`)
+
+    const recovered = await createStore({ dir }).load()
+    assert.deepEqual(recovered.observations.map(item => item.id), ['obs-keep'])
+    assert.equal(await stat(statePath).then(() => true, () => false), true, '恢复后应把备份扶正')
+    const entries = await readdir(dir)
+    assert.equal(entries.some(name => name.endsWith('.bak')), false)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('持锁进程已退出时立即回收锁，不用等满 10 分钟', async () => {
+  const { dir, store, lockPath, cleanup } = await scratch()
+  try {
+    // 起一个立刻退出的子进程，用它的 pid 伪造一把「锁还新鲜、持有者已死」的锁。
+    const dead = spawnSync(process.execPath, ['-e', '0'])
+    await writeFile(lockPath, JSON.stringify({ pid: dead.pid, host: hostname(), at: Date.now() }))
+
+    await store.mutate(state => { state.observations.push({ id: 'obs-live' }) })
+    const disk = await readJson(join(dir, 'state.json'))
+    assert.deepEqual(disk.observations.map(item => item.id), ['obs-live'])
+    assert.equal(await stat(lockPath).then(() => true, () => false), false, '锁必须被释放')
+  } finally {
+    await cleanup()
+  }
 })

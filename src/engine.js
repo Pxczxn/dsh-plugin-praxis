@@ -282,7 +282,15 @@ function pickObservations(state, ctx, task, ids) {
   return picked;
 }
 
-function observationRejection(observation) {
+/**
+ * 实现变更计数：只有「确认写入实现」才会递增，台账动作（need/inventory/step）
+ * 不动它。revision 记的是台账修订轮次，不能用来判断实现是否变过。
+ */
+function implRevisionOf(task) {
+  return Number.isFinite(task?.implRevision) ? task.implRevision : 0;
+}
+
+function observationRejection(observation, task = null) {
   if (observation.outcome !== 'success') return '工具执行失败';
   if (!EVIDENCE_KINDS.has(observation.kind)) {
     return `工具类型 ${observation.kind} 只能作过程证据，不能作为验收证明`;
@@ -292,6 +300,16 @@ function observationRejection(observation) {
   // 命令，不能算一次通过的检查。
   if (Number.isFinite(observation.exitCode) && observation.exitCode !== 0) {
     return `退出码 ${observation.exitCode}，非零退出码不能作为通过证据`;
+  }
+  // 每次确认写入实现都会让 implRevision 递增。变更之前跑出来的绿色结果只证明
+  // 旧实现，拿来给当前实现背书等于让旧证据无限复用，结项门槛就形同虚设。
+  if (task) {
+    const captured = Number.isFinite(observation.implRevisionAtCapture)
+      ? observation.implRevisionAtCapture
+      : 0;
+    if (captured !== implRevisionOf(task)) {
+      return `采集于实现第 ${captured} 版，当前第 ${implRevisionOf(task)} 版：变更前的观察不能作为当前实现的通过证据`;
+    }
   }
   return null;
 }
@@ -742,12 +760,27 @@ export function createEngine(store) {
         if (observations.length === 0) {
           throw new PraxisError('unverified', `验收项 ${row.criterionId} 缺少观察证据`);
         }
-        const rejected = observations.map((item) => ({ item, reason: observationRejection(item) }));
+        const rejected = observations.map((item) => ({ item, reason: observationRejection(item, task) }));
         const usable = rejected.filter((entry) => entry.reason === null);
         if (usable.length === 0) {
-          throw new PraxisError('unverified', `验收项 ${row.criterionId} 的观察不能证明检查通过`, {
-            hint: rejected.map((entry) => `${entry.item.id}: ${entry.reason}`).join('；'),
+          const stale = observations.every((item) => {
+            const captured = Number.isFinite(item.implRevisionAtCapture)
+              ? item.implRevisionAtCapture
+              : 0;
+            return captured !== implRevisionOf(task);
           });
+          throw stale
+            ? new PraxisError(
+                'stale-verification',
+                `验收项 ${row.criterionId} 引用的观察都采集于 revision 变更之前，不能证明当前实现`,
+                {
+                  hint: '实现变更后要重新跑一次检查，用新采集的观察作为证据',
+                  changed: false,
+                },
+              )
+            : new PraxisError('unverified', `验收项 ${row.criterionId} 的观察不能证明检查通过`, {
+                hint: rejected.map((entry) => `${entry.item.id}: ${entry.reason}`).join('；'),
+              });
         }
       }
       for (const item of observations) {
@@ -775,6 +808,9 @@ export function createEngine(store) {
       provenance,
       observationIds: allObservations.map((item) => item.id),
       revision,
+      // 审计用：这条验证是在第几版实现上取得的。观察复用按这个版本号判定，
+      // revision 记的是台账修订轮次，两者不同。
+      implRevision: implRevisionOf(task),
       valid: true,
       note: optionalString(args, 'note', LIMITS.note),
       at,
@@ -798,17 +834,32 @@ export function createEngine(store) {
             (row) => row.criterionId === item.id && row.result === 'passed' && row.observationIds.length > 0,
           ),
         );
-      const verificationTime = Math.min(
-        ...allObservations
-          .map((item) => Date.parse(String(item.at ?? '')))
-          .filter((value) => Number.isFinite(value)),
+      // 先后顺序按观察序号判定，不按时间戳：观察序号由状态单调递增分配，而
+      // 系统时钟会回拨，回拨之后「新观察的 at 更早」会让验证之后的写入看起来
+      // 发生在验证之前，于是被错误解除，结项门槛就被绕过去了。
+      const verificationSequence = Math.max(
+        ...allObservations.map((item) => (Number.isFinite(item.sequence) ? item.sequence : -1)),
       );
-      if (fullyCovered && Number.isFinite(verificationTime)) {
+      if (fullyCovered && Number.isFinite(verificationSequence) && verificationSequence >= 0) {
         const cleared = [];
         task.pendingChangeIds = task.pendingChangeIds.filter((changeId) => {
           const change = state.observations.find((item) => item?.id === changeId);
-          const changeTime = change ? Date.parse(String(change.at ?? '')) : Number.NaN;
-          if (Number.isFinite(changeTime) && changeTime < verificationTime) {
+          if (!change) return true;
+          if (Number.isFinite(change.sequence)) {
+            if (change.sequence < verificationSequence) {
+              cleared.push(changeId);
+              return false;
+            }
+            return true;
+          }
+          // 没有序号的老观察只能退回时间戳比较。
+          const changeTime = Date.parse(String(change.at ?? ''));
+          const verificationTime = Math.min(
+            ...allObservations
+              .map((item) => Date.parse(String(item.at ?? '')))
+              .filter((value) => Number.isFinite(value)),
+          );
+          if (Number.isFinite(changeTime) && Number.isFinite(verificationTime) && changeTime < verificationTime) {
             cleared.push(changeId);
             return false;
           }
@@ -995,7 +1046,7 @@ export function createEngine(store) {
       .filter((item) => item.taskId === null || item.taskId === task.id)
       .sort((a, b) => b.sequence - a.sequence);
     const page = candidates.slice(cursor, cursor + limit).map((item) => {
-      const reason = observationRejection(item);
+      const reason = observationRejection(item, item.taskId === task.id ? task : null);
       return {
         id: item.id,
         sequence: item.sequence,

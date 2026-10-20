@@ -659,3 +659,70 @@ test('非零退出码的观察不能作为通过证据', async () => {
   assert.equal(response.code, 'unverified');
   assert.match(JSON.stringify(response), /退出码/);
 });
+
+test('实现变更后，变更前的观察不能再次作为通过证据', async () => {
+  const { state, engine } = setup();
+  const started = await startedTask(engine);
+  const taskId = started.task_id;
+  await concreteNeed(engine, taskId);
+  await engine.task(ctx, { action: 'step', task_id: taskId, phase: 'implement' });
+  const task = state.tasks.find((item) => item.id === taskId);
+
+  // 变更发生前跑过的绿色测试
+  const before = addObservation(state, taskId, {
+    revisionAtCapture: task.revision,
+    implRevisionAtCapture: task.implRevision ?? 0,
+    at: '2026-01-01T00:00:00.000Z',
+  });
+
+  // 一次确认写入把实现改掉：observer 递增实现版本，旧观察随之过期
+  task.implRevision = (task.implRevision ?? 0) + 1;
+
+  const response = await engine.task(ctx, {
+    action: 'verify',
+    task_id: taskId,
+    level: 'passed',
+    scope: 'code',
+    coverage: [
+      { criterionId: started.acceptance[0].id, result: 'passed', observationIds: [before.id] },
+    ],
+  });
+  assert.equal(response.ok, false, '变更前的观察不能证明变更后的实现');
+  assert.equal(response.code, 'stale-verification');
+});
+
+test('时钟回拨时，验证之后才发生的待复核写入不会被错误解除', async () => {
+  const { state, engine } = setup();
+  const started = await startedTask(engine);
+  const taskId = started.task_id;
+  await concreteNeed(engine, taskId);
+  await engine.task(ctx, { action: 'step', task_id: taskId, phase: 'implement' });
+  const task = state.tasks.find((item) => item.id === taskId);
+
+  // 序号在前、时间戳在后：一次正常的通过检查
+  const check = addObservation(state, taskId, { at: '2026-01-01T00:20:00.000Z' });
+  // 系统时钟回拨：这次可疑写入的序号更大（确实发生在检查之后），时间戳却更早
+  const suspect = addObservation(state, taskId, {
+    at: '2026-01-01T00:10:00.000Z',
+    tool: 'bash',
+    kind: 'shell',
+    changeImpact: 'possible',
+  });
+  task.pendingChangeIds.push(suspect.id);
+
+  const response = await engine.task(ctx, {
+    action: 'verify',
+    task_id: taskId,
+    level: 'passed',
+    scope: 'code',
+    coverage: [
+      { criterionId: started.acceptance[0].id, result: 'passed', observationIds: [check.id] },
+    ],
+  });
+  assert.equal(response.ok, true);
+  assert.deepEqual(
+    task.pendingChangeIds,
+    [suspect.id],
+    '这次写入发生在验证之后，先后顺序必须按观察序号判定，不能被执行时间戳骗过去',
+  );
+});

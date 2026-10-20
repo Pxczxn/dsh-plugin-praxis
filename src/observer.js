@@ -24,6 +24,14 @@ function revisionOf(task) {
   return Number.isFinite(task?.revision) ? task.revision : 0;
 }
 
+/**
+ * 实现变更计数，只在确认写入实现时递增。台账动作不会改它，所以「观察采集于
+ * 第几版实现」是稳定的，可用来判断旧证据是否已经过期。
+ */
+function implRevisionOf(task) {
+  return Number.isFinite(task?.implRevision) ? task.implRevision : 0;
+}
+
 function ensureShape(state) {
   if (!Array.isArray(state.observations)) state.observations = [];
   if (!Array.isArray(state.tasks)) state.tasks = [];
@@ -104,6 +112,8 @@ function applyImpact(task, observation, at) {
   if (observation.changeImpact === 'confirmed') {
     const revision = revisionOf(task) + 1;
     task.revision = revision;
+    // 实现确实被改了：换一版实现号，之前采集的观察不能再给新实现背书。
+    task.implRevision = implRevisionOf(task) + 1;
     let invalidated = 0;
     if (!Array.isArray(task.verificationHistory)) task.verificationHistory = [];
     for (const verification of task.verificationHistory) {
@@ -196,6 +206,7 @@ export function recordObservation(state, input = {}) {
     toolCallId,
     taskId,
     revisionAtCapture: task ? revisionOf(task) : 0,
+    implRevisionAtCapture: task ? implRevisionOf(task) : 0,
     sequence,
     tool,
     callSummary,

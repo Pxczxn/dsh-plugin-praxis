@@ -57,7 +57,7 @@ function versionError(where, version) {
 
 function lockBusyError(lockPath) {
   return new PraxisError('lock-busy', `praxis state is locked by another process: ${lockPath}`, {
-    hint: 'Retry after that process finishes. A lock is only recovered after 10 minutes when its owner is provably gone.',
+    hint: 'Retry after that process finishes. A lock left by a local process that has exited is recovered immediately; on another host it is only recovered after 10 minutes.',
     changed: false,
   })
 }
@@ -92,7 +92,13 @@ async function readStateFile(statePath) {
   try {
     raw = await fs.readFile(statePath, 'utf8')
   } catch (error) {
-    if (error?.code === 'ENOENT') return emptyState()
+    if (error?.code === 'ENOENT') {
+      // 替换过程中崩溃会留下完整备份却没有 state.json。这里必须把备份捞回来：
+      // 当成空状态继续跑，下一次写入就会拿空对象覆盖掉全部历史。
+      const recovered = await readBackupFile(statePath)
+      if (recovered) return recovered
+      return emptyState()
+    }
     throw error
   }
   if (raw.trim() === '') return emptyState()
@@ -106,9 +112,42 @@ async function readStateFile(statePath) {
 }
 
 /**
+ * state.json 不在时，从替换失败留下的备份恢复。备份本身损坏或不存在就返回
+ * null —— 损坏的状态坚持报错，不静默当空状态。
+ */
+async function readBackupFile(statePath) {
+  const backupPath = `${statePath}.bak`
+  let raw
+  try {
+    raw = await fs.readFile(backupPath, 'utf8')
+  } catch {
+    return null
+  }
+  if (raw.trim() === '') return null
+  let state
+  try {
+    state = normalizeState(JSON.parse(raw), backupPath)
+  } catch {
+    return null
+  }
+  // 恢复后把备份扶正，免得它在下一次成功写入之后变成过期副本。
+  await fs.rename(backupPath, statePath).catch(() => {})
+  return state
+}
+
+async function fileExists(path) {
+  try {
+    await fs.stat(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
  * CONTRACT §2: temp file in the same directory -> write + fsync -> rename.
- * A failed rename falls back to copyFile. On any failure the temp file is
- * removed and the previous state.json is left untouched.
+ * 替换失败时先把旧文件挪到 state.json.bak，绝不先删除再写；任一步失败都尽量
+ * 把旧状态放回原位，并把完整的新状态留在临时文件里（keepTmp）供人工恢复。
  */
 async function atomicWrite(statePath, state) {
   const tmpPath = join(dirname(statePath), `state.json.tmp-${randomUUID()}`)
@@ -124,27 +163,50 @@ async function atomicWrite(statePath, state) {
     try {
       await fs.rename(tmpPath, statePath)
     } catch (renameError) {
-      // Some filesystems refuse rename onto an existing file. Remove the target
-      // and retry: if that rename also fails, the complete new state is still in
-      // the temp file, whereas copyFile straight over state.json can leave a
-      // half-written file when it fails midway.
-      let replaced = false
+      // 有些文件系统不允许 rename 覆盖已存在的目标。这里不能先删旧文件再写：
+      // 一旦旧文件被删，任何后续失败或崩溃都会让磁盘上不再有完整状态，下一次
+      // load 会把它当成空状态并覆盖掉全部历史。改为把旧文件原子挪到备份位。
+      const backupPath = `${statePath}.bak`
+      let backedUp = false
+      await fs.rm(backupPath, { force: true }).catch(() => {})
       try {
-        await fs.rm(statePath, { force: true })
-        await fs.rename(tmpPath, statePath)
-        replaced = true
+        await fs.rename(statePath, backupPath)
+        backedUp = true
       } catch {
-        replaced = false
+        backedUp = false
       }
-      if (!replaced) {
+      let replaced = false
+      if (backedUp) {
         try {
-          await fs.copyFile(tmpPath, statePath)
+          await fs.rename(tmpPath, statePath)
           replaced = true
-        } catch (copyError) {
-          // Keep the only complete copy of the new state for manual recovery.
+        } catch {
+          // 替换失败就把旧状态放回原位，一次写失败不能变成数据丢失。
+          await fs.rename(backupPath, statePath).catch(() => {})
+        }
+      }
+      if (replaced) {
+        await fs.rm(backupPath, { force: true }).catch(() => {})
+      } else {
+        // 只有目标位置此刻确实空着才用 copyFile 兜底。覆盖一个尚存的旧状态
+        // 可能写成半截文件，那才是真正的数据破坏。
+        const occupied = await fileExists(statePath)
+        if (!occupied) {
+          try {
+            await fs.copyFile(tmpPath, statePath)
+            replaced = true
+          } catch (copyError) {
+            const error = new Error(
+              `atomic replace failed (${renameError?.code ?? 'rename refused'}): ` +
+                `${copyError?.message ?? copyError}; complete state left at ${tmpPath}`,
+            )
+            error.keepTmp = true
+            throw error
+          }
+        } else {
           const error = new Error(
-            `atomic replace failed (${renameError?.code ?? 'rename refused'}): ` +
-              `${copyError?.message ?? copyError}; complete state left at ${tmpPath}`,
+            `atomic replace failed (${renameError?.code ?? 'rename refused'}); ` +
+              `previous state left in place, complete new state at ${tmpPath}`,
           )
           error.keepTmp = true
           throw error
@@ -221,7 +283,6 @@ class StateStore {
     } catch {
       return
     }
-    if (Date.now() - info.mtimeMs < LOCK_STALE_MS) return
     let meta
     try {
       meta = JSON.parse(await fs.readFile(this.lockPath, 'utf8'))
@@ -229,7 +290,14 @@ class StateStore {
       return
     }
     if (meta === null || typeof meta !== 'object' || Array.isArray(meta)) return
-    if (meta.host === hostname() && processAlive(Number(meta.pid))) return
+    // 同机持锁进程还活着就绝不抢占，哪怕锁已经很旧。同机持锁进程已经退出时不必
+    // 等满 10 分钟：那个进程不可能再写，继续拒绝只会让宿主崩溃之后的一段时间
+    // 完全无法记录。跨机看不到对方的进程表，只能在超时后回收。
+    const sameHost = meta.host === hostname()
+    const ownerAlive = sameHost && processAlive(Number(meta.pid))
+    const expired = Date.now() - info.mtimeMs >= LOCK_STALE_MS
+    if (ownerAlive) return
+    if (!sameHost && !expired) return
     await fs.rm(this.lockPath, { force: true }).catch(() => {})
   }
 
