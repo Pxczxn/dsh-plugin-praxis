@@ -511,6 +511,20 @@ test('changeImpact grades shell commands conservatively', () => {
   // praxis 自己的台账工具只写 state.json，不应制造阻断 done 的待复核写入。
   assert.equal(changeImpact('praxis_task', {}), 'not_applicable');
   assert.equal(changeImpact('praxis_lesson', {}), 'not_applicable');
+  // 计划类工具只写内存里的待办，同样不该制造阻断 done 的待复核写入。
+  assert.equal(changeImpact('todo_write', { todos: [] }), 'not_applicable');
+  assert.equal(changeImpact('mcp__planner__todo_write', {}), 'not_applicable');
+  // 上下文与展示类工具作用于对话，不作用于项目。
+  assert.equal(changeImpact('compress', {}), 'not_applicable');
+  assert.equal(changeImpact('ask_user_question', {}), 'not_applicable');
+  // 造临时 fixture 属于验证动作：写系统临时目录不改变实现。
+  assert.equal(changeImpact('bash', { command: 'printf "| A |\\n" > /tmp/table.md' }), 'irrelevant');
+  assert.equal(changeImpact('bash', { command: 'npm test > /tmp/log.txt' }), 'irrelevant');
+  // 但写到工作区里的文件仍然是真实变更。
+  assert.equal(changeImpact('bash', { command: 'printf "x" > out.txt' }), 'possible');
+  // fd 重定向不是文件写入。
+  assert.equal(changeImpact('bash', { command: 'node --test 2>&1 | tail -3' }), 'irrelevant');
+  assert.equal(changeImpact('bash', { command: 'npm test 2>&1' }), 'irrelevant');
 });
 
 test('classifyTool assigns the observation kind', () => {
@@ -521,4 +535,18 @@ test('classifyTool assigns the observation kind', () => {
   assert.equal(classifyTool('bash', { command: 'npx eslint src' }), 'lint');
   assert.equal(classifyTool('bash', { command: 'git status' }), 'read');
   assert.equal(classifyTool('mystery', {}), 'other');
+});
+
+test('planning and meta tools never block a completion gate', () => {
+  for (const tool of ['todo_write', 'todo_read', 'praxis_task', 'praxis_lesson', 'compress', 'ask_user_question']) {
+    assert.equal(changeImpact(tool, {}), 'not_applicable', tool);
+  }
+  assert.equal(changeImpact('mcp__planner__todo_write', {}), 'not_applicable');
+});
+
+test('scratch redirects stay out of change detection', () => {
+  assert.equal(changeImpact('bash', { command: 'printf "| A |\n" > /tmp/table.md' }), 'irrelevant');
+  assert.equal(changeImpact('bash', { command: 'npm test > /tmp/log.txt' }), 'irrelevant');
+  assert.equal(changeImpact('bash', { command: 'printf "x" > out.txt' }), 'possible');
+  assert.equal(changeImpact('bash', { command: 'npm test 2>&1' }), 'irrelevant');
 });

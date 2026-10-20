@@ -32,6 +32,32 @@ const HOST_WRITE_ALIASES = new Set([
 // would block close(done) forever.
 const LEDGER_TOOL_NAMES = new Set(['praxis_task', 'praxis_lesson']);
 
+// Planning tools (todo lists, plan documents held in memory) never touch the
+// implementation either. Treating them as "possible writes" filled
+// pendingChangeIds with noise and pushed close(done) out of reach.
+const PLANNING_TOOL_NAMES = new Set([
+  'todo_write',
+  'todo_read',
+  'todo',
+  'todos',
+  'update_plan',
+  'plan',
+  'think',
+]);
+
+// Context-management and presentation tools act on the conversation, not on
+// the project. They cannot change the implementation, so a completion gate
+// must never wait on them.
+const META_TOOL_NAMES = new Set([
+  'compress',
+  'decompress',
+  'search_context',
+  'acp_status',
+  'acp_cache',
+  'ask_user_question',
+  'present',
+]);
+
 const READ_TOOL_NAMES = new Set([
   'read',
   'read_file',
@@ -271,6 +297,12 @@ function headToken(segment) {
  * `>`/`>>` without a later `=` is a write redirection, except when the target
  * is the null device: `2>/dev/null` and `>/dev/null` do not touch the project.
  */
+// Scratch paths outside the project: writing a fixture into the OS temp
+// directory is part of building a check, not a change to the implementation.
+// Anything relative (out.txt) or inside the repo still counts as a write.
+const TEMP_TARGET =
+  /^(?:[/\\]tmp[/\\]|[/\\]var[/\\]tmp[/\\]|[/\\]dev[/\\]shm[/\\]|\$TMPDIR|\$\{TMPDIR\}|%TEMP%|[a-z]:[\\/](?:.*[\\/])?temp[\\/])/i;
+
 function hasWriteRedirect(segment) {
   const pattern = /(?:\d?>>?)(?!=)\s*([^\s;|&<>]*)?/g;
   let match;
@@ -279,6 +311,7 @@ function hasWriteRedirect(segment) {
     if (!target) continue;
     if (target.toLowerCase() === 'nul') continue;
     if (/^\/dev\/null$/i.test(target)) continue;
+    if (TEMP_TARGET.test(target)) continue;
     return true;
   }
   return false;
@@ -713,6 +746,8 @@ export function changeImpact(name, args) {
   const base = baseName(name);
   if (!base) return 'possible';
   if (LEDGER_TOOL_NAMES.has(base)) return 'not_applicable';
+  if (PLANNING_TOOL_NAMES.has(base)) return 'not_applicable';
+  if (META_TOOL_NAMES.has(base)) return 'not_applicable';
   if (isWriteTool(base)) return 'confirmed';
   if (isReadTool(base)) return 'not_applicable';
   if (isShellTool(base)) {
