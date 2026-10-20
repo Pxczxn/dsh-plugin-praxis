@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -106,6 +107,47 @@ test('resolveService 属性可用时优先用属性，都不存在时返回 null
     null,
   );
   assert.equal(resolveService(undefined, 'sessions'), null);
+});
+
+test('子代理会话的 cwd 是父会话复制来的，不能据此把子任务记到父项目名下', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'praxis-child-'));
+  try {
+    // 把目录做成真正的 git 仓库：父会话在这里能得到正确的 projectKey，
+    // 子会话即使 header.cwd 指向同一个仓库，也必须拒绝推断。
+    execFileSync('git', ['init', '--quiet', dir], { stdio: 'ignore', windowsHide: true });
+    resetProjectCache();
+
+    const childHeader = {
+      cwd: dir,
+      // 宿主 childSessionMeta 的真实字段（见 ~/.dsh/sessions 下子会话记录）。
+      parentSession: 'session-parent',
+      origin: 'subagent',
+      delegationDepth: 1,
+    };
+    const childCtx = {
+      tools: { register() {} },
+      get(name) {
+        return name === 'sessions' ? { get: () => ({ header: childHeader }) } : undefined;
+      },
+    };
+    const child = contextOf({ agent: { id: 'session-child' } }, childCtx);
+    assert.equal(child.cwd, null, '继承来的工作目录不是子会话自己的证据');
+    assert.equal(child.projectKey, null, '子代理可能在别的工作区执行，不能冒用父项目');
+
+    // 同一目录上的父会话仍然照常解析项目。
+    const parentCtx = {
+      tools: { register() {} },
+      get(name) {
+        return name === 'sessions' ? { get: () => ({ header: { cwd: dir } }) } : undefined;
+      },
+    };
+    const parent = contextOf({ agent: { id: 'session-parent' } }, parentCtx);
+    assert.equal(parent.cwd, dir);
+    assert.ok(parent.projectKey, '父会话的项目归属不能被一起废掉');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    resetProjectCache();
+  }
 });
 
 test('resetProjectCache 后仍能安全解析，且 cwd 缺失时不猜测 projectKey', async () => {

@@ -301,6 +301,13 @@ function observationRejection(observation, task = null) {
   if (Number.isFinite(observation.exitCode) && observation.exitCode !== 0) {
     return `退出码 ${observation.exitCode}，非零退出码不能作为通过证据`;
   }
+  // 这条观察可能夹带了实现修改（命令里混了写操作，或无法确认是否写入）。它
+  // 同时会进待复核队列，若还允许它充当通过证据，一条命令就能既给自己背书又
+  // 解除自己的嫌疑，close(done) 的硬门槛被绕过。宁可要求重跑一条判定为只读
+  // 的检查命令。
+  if (observation.changeImpact === 'possible') {
+    return '这条观察可能包含实现写入，不能作为当前实现的通过证据';
+  }
   // 每次确认写入实现都会让 implRevision 递增。变更之前跑出来的绿色结果只证明
   // 旧实现，拿来给当前实现背书等于让旧证据无限复用，结项门槛就形同虚设。
   if (task) {
@@ -827,9 +834,13 @@ export function createEngine(store) {
     // 都被本次验证覆盖时才解除，避免用局部验证洗掉可疑写入。
     if (level === 'passed' && task.pendingChangeIds.length > 0) {
       const activeItems = task.acceptance.filter((item) => item.active);
+      // 人工验收项只能由人确认，任何观察都覆盖不到它。若把它算进「必须全部
+      // 覆盖」，带人工验收项的任务就永远解不除待复核写入——自动证据与人工
+      // 判断互相拖死。这里只看能被观察覆盖的项；全是人工项时不解解除。
+      const coverableItems = activeItems.filter((item) => item.kind !== 'manual');
       const fullyCovered =
-        activeItems.length > 0 &&
-        activeItems.every((item) =>
+        coverableItems.length > 0 &&
+        coverableItems.every((item) =>
           perRow.some(
             (row) => row.criterionId === item.id && row.result === 'passed' && row.observationIds.length > 0,
           ),
@@ -845,8 +856,18 @@ export function createEngine(store) {
         task.pendingChangeIds = task.pendingChangeIds.filter((changeId) => {
           const change = state.observations.find((item) => item?.id === changeId);
           if (!change) return true;
+          // 解除只看先后，不看这条写入采集于哪一版实现：能执行到这里说明本次
+          // 验证引用的观察都属于当前实现版本（旧版本的观察在 observationRejection
+          // 就被 stale-verification 拦下），所以验证确实发生在最后一次改动之后，
+          // 此前所有可疑写入都已被它覆盖。反过来，验证之后又发生的写入序号更大，
+          // 自然留在队列里等下一轮。若再拿 implRevision 卡一道「版本必须相同」，
+          // 那些跨过几次改动仍留在队列里的旧嫌疑就永远等不到匹配的版本号，
+          // close(done) 会被历史记录永久阻断。
           if (Number.isFinite(change.sequence)) {
-            if (change.sequence < verificationSequence) {
+            // 用「小于等于」：验证引用的那条观察本身也会进待复核队列（一条命令
+            // 里同时跑测试和自定义脚本时必然如此），严格小于永远清不掉它，
+            // close(done) 就被这次验证自己永久阻断。
+            if (change.sequence <= verificationSequence) {
               cleared.push(changeId);
               return false;
             }

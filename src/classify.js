@@ -6,6 +6,9 @@
 // state.json and shown back to the model, so secrets are redacted before any
 // clipping and stdout is never stored whole.
 
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { LIMITS, clip } from './evidence.js';
 
 // The exact set from CONTRACT §4. Kept literal so the contract test and the
@@ -441,6 +444,44 @@ const PURE_READ_COMMANDS = new Set([
   'rg',
   'ag',
   'ack',
+  // 校验和与编码转换只读取输入、把结果写到 stdout；写文件仍由重定向检测拦下。
+  'sha1sum',
+  'sha224sum',
+  'sha256sum',
+  'sha384sum',
+  'sha512sum',
+  'md5sum',
+  'shasum',
+  'b2sum',
+  'cksum',
+  'xxd',
+  'od',
+  'hexdump',
+  'strings',
+  'base64',
+  'nl',
+  'fold',
+  'paste',
+  'column',
+  'expand',
+  'unexpand',
+  'rev',
+  'tac',
+  'seq',
+  // PowerShell 的纯读过滤器：只从管道读、把结果写到 stdout。不收录
+  // for-each-object / where-object（会执行任意脚本块）和 tee-object（写文件），
+  // 那类命令保持保守判定，不用放宽去换误报。
+  'select-string',
+  'measure-object',
+  'sort-object',
+  'select-object',
+  'out-string',
+  'out-null',
+  'group-object',
+  'convertto-json',
+  'convertfrom-json',
+  'format-table',
+  'format-list',
 ]);
 
 const WRITE_COMMANDS = new Set([
@@ -551,17 +592,73 @@ function isWriteCommand(segment, head) {
   return false;
 }
 
+// ---------- npm run <script> 展开 ----------
+//
+// `npm run bench` 的脚本名本身不说明它做什么：它可能是 `node --test`，也可能
+// 是任意一段能写文件的 JS。只有真读到 package.json 且脚本体全部落在已认识的
+// 检查命令上时才放宽；读不到、脚本不存在、脚本体里有写命令，一律保持保守。
+
+const PACKAGE_CACHE_MS = 60_000;
+const packageCache = new Map();
+const RUN_SCRIPT = /^(?:npm|pnpm|yarn)\s+run\s+([\w:@./-]+)\s*$/;
+const MAX_SCRIPT_DEPTH = 2;
+
+function readPackageJson(cwd) {
+  if (typeof cwd !== 'string' || cwd === '') return null;
+  const cached = packageCache.get(cwd);
+  if (cached && Date.now() - cached.at < PACKAGE_CACHE_MS) return cached.value;
+  let value = null;
+  try {
+    const parsed = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8'));
+    if (parsed && typeof parsed === 'object') value = parsed;
+  } catch {
+    value = null;
+  }
+  packageCache.set(cwd, { at: Date.now(), value });
+  return value;
+}
+
+/** 清空 package.json 缓存。 */
+export function resetPackageCache() {
+  packageCache.clear();
+}
+
+function scriptBodyOf(normalized, options) {
+  const match = RUN_SCRIPT.exec(normalized);
+  if (!match) return null;
+  const pkg = readPackageJson(options?.cwd);
+  const body = pkg?.scripts?.[match[1]];
+  if (typeof body !== 'string') return null;
+  const trimmed = body.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
 /**
  * Grade one simple command segment. Returns one of:
  * 'read-only' | 'test' | 'lint' | 'build' | 'possible-write' | 'unknown'.
  */
-function commandImpact(segment) {
+function commandImpact(segment, options = {}) {
   const normalized = normalizeSegment(segment);
   if (!normalized) return 'read-only';
   if (hasWriteRedirect(normalized)) return 'possible-write';
 
   const head = headToken(normalized);
   if (!head) return 'unknown';
+
+  // 脚本名不等于行为：展开脚本体之后再判。
+  const depth = Number.isFinite(options.depth) ? options.depth : 0;
+  if (depth < MAX_SCRIPT_DEPTH) {
+    const body = scriptBodyOf(normalized, options);
+    if (body !== null) {
+      const impacts = shellImpact(body, { ...options, depth: depth + 1 });
+      if (impacts.every((impact) => impact === 'read-only' || impact === 'test' || impact === 'lint')) {
+        if (impacts.includes('test')) return 'test';
+        if (impacts.includes('lint')) return 'lint';
+        return 'read-only';
+      }
+      return 'unknown';
+    }
+  }
 
   if (isTestCommand(normalized)) return 'test';
   if (isLintCommand(normalized)) {
@@ -574,14 +671,14 @@ function commandImpact(segment) {
   return 'unknown';
 }
 
-function shellImpact(command) {
+function shellImpact(command, options = {}) {
   const segments = splitSimpleCommands(stripQuoted(command));
   if (segments.length === 0) return ['unknown'];
-  return segments.map(commandImpact);
+  return segments.map((segment) => commandImpact(segment, options));
 }
 
 /** @returns {'read'|'write'|'test'|'build'|'lint'|'other'} */
-export function classifyTool(name, args) {
+export function classifyTool(name, args, options = {}) {
   const base = baseName(name);
   if (!base) return 'other';
   if (isWriteTool(base)) return 'write';
@@ -589,7 +686,11 @@ export function classifyTool(name, args) {
   if (isShellTool(base)) {
     const command = shellCommand(args);
     if (!command.trim()) return 'other';
-    const impacts = shellImpact(command);
+    const impacts = shellImpact(command, options);
+    // 一次调用里既有检查又有写入时，检查结果产生在写入之前，证明不了写入之后
+    // 的实现；整条命令降为 other，逼调用方重跑一条干净的检查命令，而不是让
+    // 这条「先测试、后改源码」的调用既当证据又当嫌疑对象。
+    if (impacts.includes('possible-write')) return 'other';
     if (impacts.includes('test')) return 'test';
     if (impacts.includes('lint')) return 'lint';
     if (impacts.includes('build')) return 'build';
@@ -617,6 +718,39 @@ function tailClip(value, max) {
   const text = String(value ?? '');
   if (text.length <= max) return text;
   return `…${text.slice(text.length - (max - 1))}`;
+}
+
+const SUMMARY_STRING_LIMIT = 160;
+const SUMMARY_MAX_DEPTH = 2;
+const SUMMARY_MAX_ITEMS = 3;
+const SUMMARY_MAX_KEYS = 6;
+
+/**
+ * 嵌套参数的紧凑表示：保留结构与关键文本，避免整段压成 `[object]`。
+ * 深于 SUMMARY_MAX_DEPTH 的层级只留类型占位，防止摘要被一个巨大对象撑爆。
+ */
+function compactValue(value, depth = 0) {
+  if (value === null) return null;
+  if (typeof value === 'string') return clip(value, SUMMARY_STRING_LIMIT);
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (Array.isArray(value)) {
+    if (depth >= SUMMARY_MAX_DEPTH) return `[${value.length} items]`;
+    const head = value.slice(0, SUMMARY_MAX_ITEMS).map((item) => compactValue(item, depth + 1));
+    if (value.length > SUMMARY_MAX_ITEMS) head.push(`+${value.length - SUMMARY_MAX_ITEMS} more`);
+    return head;
+  }
+  if (typeof value === 'object') {
+    if (depth >= SUMMARY_MAX_DEPTH) return '{…}';
+    const nested = {};
+    for (const [key, item] of Object.entries(value).slice(0, SUMMARY_MAX_KEYS)) {
+      nested[key] =
+        CONTENT_KEYS.has(key) && typeof item === 'string' && item.length > 40
+          ? `[${item.length} chars]`
+          : compactValue(item, depth + 1);
+    }
+    return nested;
+  }
+  return String(value);
 }
 
 /**
@@ -659,7 +793,7 @@ export function summarizeCall(name, args) {
         } else if (Array.isArray(value) && value.every((item) => typeof item === 'string' || typeof item === 'number')) {
           compact[key] = value;
         } else {
-          compact[key] = '[object]';
+          compact[key] = compactValue(value, 0);
         }
       }
       try {
@@ -742,7 +876,7 @@ export function summarizeResult(result) {
 /**
  * @returns {'confirmed'|'possible'|'irrelevant'|'not_applicable'}
  */
-export function changeImpact(name, args) {
+export function changeImpact(name, args, options = {}) {
   const base = baseName(name);
   if (!base) return 'possible';
   if (LEDGER_TOOL_NAMES.has(base)) return 'not_applicable';
@@ -753,7 +887,7 @@ export function changeImpact(name, args) {
   if (isShellTool(base)) {
     const command = shellCommand(args);
     if (!command.trim()) return 'possible';
-    const impacts = shellImpact(command);
+    const impacts = shellImpact(command, options);
     if (impacts.length === 0) return 'possible';
     // Only plain reads and read-only checks keep old verifications valid. A
     // build or a write-capable segment means the implementation may have

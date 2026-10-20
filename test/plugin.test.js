@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -142,6 +142,39 @@ test('dispose 可重复调用且不抛错', async () => {
     assert.doesNotThrow(() => dispose());
   } finally {
     await cleanup();
+  }
+});
+
+test('config.dataDir 覆盖默认目录，便于隔离验证', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'praxis-config-'));
+  const envDir = await mkdtemp(join(tmpdir(), 'praxis-env-'));
+  const previous = process.env.DSH_PRAXIS_DATA_DIR;
+  process.env.DSH_PRAXIS_DATA_DIR = envDir;
+  const plugin = await import('../index.js');
+  const registered = [];
+  const ctx = {
+    tools: { register: (definition) => (registered.push(definition), () => {}) },
+    on: () => () => {},
+  };
+  try {
+    const dispose = plugin.apply(ctx, { dataDir: dir });
+    const started = await registered[0].execute(
+      { action: 'start', goal: '隔离数据目录' },
+      { agent: { id: 'session-9' }, callId: 'call-9' },
+    );
+    assert.equal(started.ok, true, JSON.stringify(started));
+
+    const written = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'));
+    assert.equal(written.tasks.length, 1);
+    assert.equal(written.tasks[0].goal, '隔离数据目录');
+    // 环境变量指向的目录必须保持干净：配置优先，而不是两边都写。
+    await assert.rejects(() => readFile(join(envDir, 'state.json'), 'utf8'), /ENOENT/);
+    dispose();
+  } finally {
+    if (previous === undefined) delete process.env.DSH_PRAXIS_DATA_DIR;
+    else process.env.DSH_PRAXIS_DATA_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+    await rm(envDir, { recursive: true, force: true });
   }
 });
 

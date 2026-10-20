@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { attachObserver, MAX_OBSERVATIONS, recordObservation } from '../src/observer.js';
 import { changeImpact, classifyTool, summarizeCall, summarizeResult } from '../src/classify.js';
@@ -506,8 +509,30 @@ test('changeImpact grades shell commands conservatively', () => {
   assert.equal(changeImpact('bash', { command: 'ls && rm -rf dist' }), 'possible');
   assert.equal(changeImpact('bash', { command: 'echo hello > out.txt' }), 'possible');
   assert.equal(changeImpact('bash', { command: 'echo "npm test" > /dev/null' }), 'irrelevant');
+  // 校验和与编码转换只读输入、结果进 stdout；它们曾被判成 possible 并卡住结项。
+  assert.equal(changeImpact('bash', { command: 'sha256sum src/a.js test/b.js' }), 'irrelevant');
+  assert.equal(changeImpact('bash', { command: 'md5sum a' }), 'irrelevant');
+  assert.equal(changeImpact('bash', { command: 'cksum a' }), 'irrelevant');
+  assert.equal(changeImpact('bash', { command: 'xxd -l 16 a' }), 'irrelevant');
+  assert.equal(changeImpact('bash', { command: 'base64 a' }), 'irrelevant');
+  // 但只读命令一旦重定向或接进写管道，必须重新变成 possible。
+  assert.equal(changeImpact('bash', { command: 'sha256sum a > sums.txt' }), 'possible');
+  assert.equal(changeImpact('bash', { command: 'md5sum a >> sums.txt' }), 'possible');
+  assert.equal(changeImpact('bash', { command: 'xxd a | tee dump.txt' }), 'possible');
   assert.equal(changeImpact('bash', { command: 'mystery-tool --flag' }), 'possible');
   assert.equal(changeImpact('some_mcp_tool', {}), 'possible');
+  // 同一次调用里既有测试又有源码写入：整条命令不能再自称检查证据。
+  assert.equal(classifyTool('bash', { command: 'npm test && echo x > src/a.js' }), 'other');
+  assert.equal(changeImpact('bash', { command: 'npm test && echo x > src/a.js' }), 'possible');
+  assert.equal(classifyTool('bash', { command: 'npm test; printf y > src/b.js' }), 'other');
+  assert.equal(changeImpact('bash', { command: 'npm test; printf y > src/b.js' }), 'possible');
+  // 纯测试接 PowerShell 过滤器/统计是只读的：不能因为不认识 cmdlet 就整体判成写入。
+  assert.equal(classifyTool('bash', { command: 'npm test 2>&1 | Select-String -Pattern pass' }), 'test');
+  assert.equal(changeImpact('bash', { command: 'npm test 2>&1 | Select-String -Pattern pass' }), 'irrelevant');
+  assert.equal(changeImpact('bash', { command: 'npm test | Measure-Object' }), 'irrelevant');
+  // 但 tee 写文件仍然算可能的写入。
+  assert.equal(changeImpact('bash', { command: 'npm test | tee out.txt' }), 'possible');
+  assert.equal(changeImpact('bash', { command: 'cat a | tee b' }), 'possible');
   // praxis 自己的台账工具只写 state.json，不应制造阻断 done 的待复核写入。
   assert.equal(changeImpact('praxis_task', {}), 'not_applicable');
   assert.equal(changeImpact('praxis_lesson', {}), 'not_applicable');
@@ -549,4 +574,74 @@ test('scratch redirects stay out of change detection', () => {
   assert.equal(changeImpact('bash', { command: 'npm test > /tmp/log.txt' }), 'irrelevant');
   assert.equal(changeImpact('bash', { command: 'printf "x" > out.txt' }), 'possible');
   assert.equal(changeImpact('bash', { command: 'npm test 2>&1' }), 'irrelevant');
+});
+
+test('只会写文件的命令永远进不了只读白名单', () => {
+  const writers = ['rm', 'mv', 'cp', 'tee', 'dd', 'mkdir', 'touch', 'chmod', 'truncate', 'install', 'patch', 'rsync'];
+  for (const command of writers) {
+    assert.equal(changeImpact('bash', { command }), 'possible', command);
+    assert.equal(changeImpact('bash', { command: `${command} target.txt` }), 'possible', command);
+  }
+});
+
+test('summarizeCall keeps nested argument structure instead of collapsing it', () => {
+  const line = summarizeCall('praxis_task', {
+    action: 'inventory',
+    task_id: 'task-1',
+    needs: [{ target: 'CSV 序列化层', decision: 'reuse', evidence: 'src/csv.js:12' }],
+  });
+  assert.ok(!line.includes('[object]'), line);
+  assert.ok(line.includes('CSV 序列化层'), line);
+  assert.ok(line.includes('src/csv.js:12'), line);
+  // 足够深的嵌套仍要被压掉，避免摘要被一个巨大参数撑爆。
+  const deep = summarizeCall('mcp__x__call', { a: { b: { c: { d: [1, 2, 3, 4, 5, 6] } } } });
+  assert.ok(!deep.includes('[object]'), deep);
+  assert.ok(deep.length <= 200, deep);
+});
+
+// npm run <script> 的脚本名本身不说明它做什么，必须看 package.json 里的脚本体。
+// 只有脚本体全部落在已知的检查命令上才放宽；自定义脚本执行任意代码，保持保守。
+test('npm run 只在脚本体可确认时放宽，自定义脚本仍然算可能的写入', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'praxis-classify-'));
+  try {
+    writeFileSync(
+      join(dir, 'package.json'),
+      JSON.stringify({
+        name: 'demo',
+        scripts: {
+          check: 'node --test',
+          lint: 'eslint .',
+          bench: 'node bench/bench.js',
+          deploy: 'node deploy.js && rm -rf dist',
+        },
+      }),
+      'utf8',
+    );
+
+    assert.equal(classifyTool('bash', { command: 'npm run check' }, { cwd: dir }), 'test');
+    assert.equal(changeImpact('bash', { command: 'npm run check' }, { cwd: dir }), 'irrelevant');
+    assert.equal(changeImpact('bash', { command: 'npm run lint' }, { cwd: dir }), 'irrelevant');
+
+    // bench 跑的是项目自己写的 JS，可能写文件，不能一律当只读。
+    assert.equal(classifyTool('bash', { command: 'npm run bench' }, { cwd: dir }), 'other');
+    assert.equal(changeImpact('bash', { command: 'npm run bench' }, { cwd: dir }), 'possible');
+
+    // 脚本体本身含写命令时同样保持保守。
+    assert.equal(changeImpact('bash', { command: 'npm run deploy' }, { cwd: dir }), 'possible');
+
+    // 没有 cwd、cwd 下没有 package.json、脚本不存在：都退回原有保守判定。
+    // （`npm run check` 这种脚本名本身已在既有 lint 白名单里，与 cwd 无关；
+    // 这里用 bench 才能看出「有没有读到 package.json」的差别。）
+    assert.equal(changeImpact('bash', { command: 'npm run bench' }), 'possible');
+    assert.equal(
+      changeImpact('bash', { command: 'npm run bench' }, { cwd: join(dir, 'missing') }),
+      'possible',
+    );
+    assert.equal(changeImpact('bash', { command: 'npm run nope' }, { cwd: dir }), 'possible');
+
+    // 写重定向优先：即使在检查脚本后面也不能豁免。
+    assert.equal(changeImpact('bash', { command: 'npm run check > out.txt' }, { cwd: dir }), 'possible');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -30,8 +30,21 @@ function warn(ctx, message) {
   else console.warn(`[praxis] ${message}`);
 }
 
-export function apply(ctx) {
-  const store = createStore();
+/**
+ * 数据目录：宿主配置优先于默认值。
+ *
+ * 宿主里插件是单例，隔离验证只能在 profile 的 patch 层覆盖 dataDir，
+ * 没法在会话里临时切换；显式配置也让数据文件位置可审计。
+ */
+function dataDirFrom(config) {
+  const direct = config?.dataDir;
+  if (typeof direct === 'string' && direct.trim() !== '') return direct.trim();
+  return undefined;
+}
+
+export function apply(ctx, config) {
+  const dir = dataDirFrom(config);
+  const store = dir ? createStore({ dir }) : createStore();
   const engine = createEngine(store);
   const handlers = createHandlers({
     engine,

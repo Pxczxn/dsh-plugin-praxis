@@ -30,17 +30,35 @@ function resolveSessions(ctx) {
   return resolveService(ctx, 'sessions');
 }
 
-function resolveCwd(ctx, sessionId) {
+function sessionHeader(ctx, sessionId) {
   if (!sessionId) return null;
   const sessions = resolveSessions(ctx);
   if (!sessions || typeof sessions.get !== 'function') return null;
   try {
-    const session = sessions.get(sessionId);
-    const cwd = session?.header?.cwd;
-    return typeof cwd === 'string' && cwd !== '' ? cwd : null;
+    return sessions.get(sessionId)?.header ?? null;
   } catch {
     return null;
   }
+}
+
+/**
+ * 是否是子代理会话。
+ *
+ * 宿主创建子会话时把父会话的 cwd 原样抄进 header（子会话记录里同时带
+ * `parentSession` / `origin: 'subagent'` / `delegationDepth`，但 cwd 仍是父目录），
+ * 而子代理完全可能被派到别的工作区干活。拿这个继承来的 cwd 推 projectKey，
+ * 会把子任务记到父项目名下，项目级经验就会跨项目可见。宁可返回 null。
+ */
+function isChildSession(header) {
+  if (!header || typeof header !== 'object') return false;
+  if (header.origin === 'subagent') return true;
+  if (typeof header.parentSession === 'string' && header.parentSession !== '') return true;
+  return Number.isFinite(header.delegationDepth) && header.delegationDepth > 0;
+}
+
+function headerCwd(header) {
+  const cwd = header?.cwd;
+  return typeof cwd === 'string' && cwd !== '' ? cwd : null;
 }
 
 function gitToplevel(cwd) {
@@ -70,13 +88,23 @@ function gitToplevel(cwd) {
  */
 export function contextOf(exec, ctx) {
   const sessionId = exec?.agent?.id ?? null;
-  const cwd = resolveCwd(ctx, sessionId);
-  return {
-    sessionId: sessionId ?? null,
-    agentId: sessionId ?? null,
-    cwd: cwd ?? null,
-    projectKey: cwd ? gitToplevel(cwd) : null,
-  };
+  return { sessionId, agentId: sessionId, ...sessionContext(ctx, sessionId) };
+}
+
+/**
+ * 会话的工作区与项目键。
+ *
+ * pre-step 只有 agent.id、没有工具执行上下文，需要单独推导一次；与 contextOf
+ * 共用同一份 60 秒缓存，不额外跑 git。
+ */
+export function sessionContext(ctx, sessionId) {
+  const header = sessionHeader(ctx, sessionId);
+  const cwd = headerCwd(header);
+  if (!cwd) return { cwd: null, projectKey: null };
+  // 子会话的 cwd 是父会话复制过来的，既不能当项目归属证据，也不能用来
+  // 推断「这条命令在哪个项目里跑」；连 cwd 一起置空，让下游走保守判定。
+  if (isChildSession(header)) return { cwd: null, projectKey: null };
+  return { cwd, projectKey: gitToplevel(cwd) };
 }
 
 export function resetProjectCache() {

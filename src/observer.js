@@ -10,6 +10,7 @@
 import { createHash } from 'node:crypto';
 import { LIMITS, clip } from './evidence.js';
 import { changeImpact, classifyTool, summarizeCall, summarizeResult } from './classify.js';
+import { sessionContext } from './context.js';
 
 /** Hard cap on retained observations (design §3.4 / CONTRACT §5). */
 export const MAX_OBSERVATIONS = 1000;
@@ -179,8 +180,11 @@ export function recordObservation(state, input = {}) {
   const at = new Date().toISOString();
   const sequence = Math.floor(state.nextObservation);
   const id = `obs-${sequence}`;
-  const kind = classifyTool(tool, input.args);
-  const impact = changeImpact(tool, input.args);
+  // cwd 只用来读项目 package.json 判 `npm run <script>` 的脚本体；来源不可信
+  // （例如子会话继承的父目录）时上游已经给 null，这里就退回保守判定。
+  const cwd = textOrNull(input.cwd) ?? undefined;
+  const kind = classifyTool(tool, input.args, { cwd });
+  const impact = changeImpact(tool, input.args, { cwd });
   const callSummary = summarizeCall(tool, input.args);
   const result = summarizeResult(input.result);
 
@@ -278,6 +282,10 @@ export function attachObserver(ctx, store) {
       const tool = textOrNull(call?.name) ?? textOrNull(call?.tool);
       if (!sessionId || !toolCallId || !tool) return;
 
+      // Shell 命令的用途要靠项目 package.json 才能判准；子会话的继承目录
+      // 在这一步已经返回 null，于是不会被当成项目证据。
+      const { cwd } = sessionContext(ctx, sessionId);
+
       await store.mutate((state) => {
         recordObservation(state, {
           sessionId,
@@ -287,6 +295,7 @@ export function attachObserver(ctx, store) {
           tool,
           args: call?.arguments ?? call?.args ?? null,
           result,
+          cwd,
         });
       });
     } catch {

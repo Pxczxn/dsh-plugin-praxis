@@ -691,6 +691,124 @@ test('实现变更后，变更前的观察不能再次作为通过证据', async
   assert.equal(response.code, 'stale-verification');
 });
 
+test('同一条命令既跑测试又改源码时，它不能充当通过证据', async () => {
+  const { state, engine } = setup();
+  const started = await startedTask(engine);
+  const taskId = started.task_id;
+  await concreteNeed(engine, taskId);
+  await engine.task(ctx, { action: 'step', task_id: taskId, phase: 'implement' });
+  const task = state.tasks.find((item) => item.id === taskId);
+
+  // 回归素材：`npm test && echo x > src/math.js` —— 检查跑在写入之前，结果证明
+  // 不了写入之后的实现。若它还允许充当证据，一条命令就能既给自己背书、又解除
+  // 自己的嫌疑，close(done) 的硬门槛被绕过。
+  const mixed = addObservation(state, taskId, {
+    tool: 'bash',
+    kind: 'test',
+    callSummary: 'npm test && echo x > src/math.js',
+    changeImpact: 'possible',
+    implRevisionAtCapture: task.implRevision ?? 0,
+  });
+  task.pendingChangeIds.push(mixed.id);
+
+  const response = await engine.task(ctx, {
+    action: 'verify',
+    task_id: taskId,
+    level: 'passed',
+    scope: 'npm test',
+    coverage: [
+      { criterionId: started.acceptance[0].id, result: 'passed', observationIds: [mixed.id] },
+    ],
+  });
+  assert.equal(response.ok, false, '可疑观察不能给自己背书');
+  assert.equal(response.code, 'unverified');
+  const status = await engine.task(ctx, { action: 'status', task_id: taskId });
+  const row = status.data.observations.find((item) => item.id === mixed.id);
+  assert.match(row?.rejectedReason ?? '', /可能包含实现写入/);
+  assert.deepEqual(task.pendingChangeIds, [mixed.id], '被拒绝之后嫌疑仍然保留');
+});
+
+test('干净测试观察可以解除此前可能的写入，队列清零并允许 close(done)', async () => {
+  const { state, engine } = setup();
+  const started = await startedTask(engine);
+  const taskId = started.task_id;
+  await concreteNeed(engine, taskId);
+  await engine.task(ctx, { action: 'step', task_id: taskId, phase: 'implement' });
+  const task = state.tasks.find((item) => item.id === taskId);
+
+  const suspect = addObservation(state, taskId, {
+    tool: 'bash',
+    kind: 'other',
+    callSummary: 'node bench/bench.js',
+    changeImpact: 'possible',
+  });
+  task.pendingChangeIds.push(suspect.id);
+
+  const check = addObservation(state, taskId, { changeImpact: 'irrelevant' });
+  const response = await engine.task(ctx, {
+    action: 'verify',
+    task_id: taskId,
+    level: 'passed',
+    scope: 'node --test',
+    coverage: [
+      { criterionId: started.acceptance[0].id, result: 'passed', observationIds: [check.id] },
+    ],
+  });
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.deepEqual(task.pendingChangeIds, [], '独立跑的干净检查应当解除此前的可疑写入');
+
+  const done = await engine.task(ctx, {
+    action: 'close',
+    task_id: taskId,
+    outcome: 'done',
+    implementationStatus: 'complete',
+  });
+  assert.equal(done.ok, true, JSON.stringify(done));
+});
+
+test('跨实现版本的旧待复核写入在后续有效验证后必须被解除，不能永久阻断 close(done)', async () => {
+  const { state, engine } = setup();
+  const started = await startedTask(engine);
+  const taskId = started.task_id;
+  await concreteNeed(engine, taskId);
+  await engine.task(ctx, { action: 'step', task_id: taskId, phase: 'implement' });
+  const task = state.tasks.find((item) => item.id === taskId);
+
+  // 第 0 版实现上采集的一条可疑写入（典型是自定义 benchmark 命令）
+  const suspect = addObservation(state, taskId, {
+    tool: 'bash',
+    kind: 'shell',
+    changeImpact: 'possible',
+    implRevisionAtCapture: 0,
+  });
+  task.pendingChangeIds.push(suspect.id);
+
+  // 之后实现被真实改动过两次，这条嫌疑写入停留在了旧版本上
+  task.implRevision = 2;
+
+  // 当前版本上跑出的测试观察
+  const check = addObservation(state, taskId, {
+    implRevisionAtCapture: 2,
+    revisionAtCapture: task.revision,
+  });
+
+  const response = await engine.task(ctx, {
+    action: 'verify',
+    task_id: taskId,
+    level: 'passed',
+    scope: 'node --test',
+    coverage: [
+      { criterionId: started.acceptance[0].id, result: 'passed', observationIds: [check.id] },
+    ],
+  });
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.deepEqual(
+    task.pendingChangeIds,
+    [],
+    '旧版本上的嫌疑写入已被后续改动与这次验证覆盖，必须解除；若拿「版本必须相同」再卡一道，它永远等不到匹配的版本号，close(done) 被历史记录永久阻断',
+  );
+});
+
 test('时钟回拨时，验证之后才发生的待复核写入不会被错误解除', async () => {
   const { state, engine } = setup();
   const started = await startedTask(engine);
@@ -724,5 +842,44 @@ test('时钟回拨时，验证之后才发生的待复核写入不会被错误�
     task.pendingChangeIds,
     [suspect.id],
     '这次写入发生在验证之后，先后顺序必须按观察序号判定，不能被执行时间戳骗过去',
+  );
+});
+
+test('人工验收项不会阻塞待复核写入的解除', async () => {
+  const { state, engine } = setup();
+  const started = await startedTask(engine, {
+    acceptance: [
+      { text: 'node --test 全部通过', kind: 'automated' },
+      { text: '人工复核输出是否可读', kind: 'manual' },
+    ],
+  });
+  const taskId = started.task_id;
+  await concreteNeed(engine, taskId);
+  await engine.task(ctx, { action: 'step', task_id: taskId, phase: 'implement' });
+  const task = state.tasks.find((item) => item.id === taskId);
+
+  const suspect = addObservation(state, taskId, {
+    tool: 'bash',
+    kind: 'shell',
+    changeImpact: 'possible',
+    implRevisionAtCapture: 0,
+  });
+  task.pendingChangeIds.push(suspect.id);
+
+  const check = addObservation(state, taskId, { revisionAtCapture: task.revision });
+  const response = await engine.task(ctx, {
+    action: 'verify',
+    task_id: taskId,
+    level: 'passed',
+    scope: 'node --test',
+    coverage: [
+      { criterionId: started.acceptance[0].id, result: 'passed', observationIds: [check.id] },
+    ],
+  });
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.deepEqual(
+    task.pendingChangeIds,
+    [],
+    '人工验收项任何观察都覆盖不到，不能因为它在「必须全部覆盖」里就把自动证据的解除路径堵死',
   );
 });

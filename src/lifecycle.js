@@ -1,6 +1,6 @@
 // 生命周期钩子：静态指引段落、每轮一次提醒、轮次停止诊断。只做提醒，不改写任务状态。
-import { clip } from './evidence.js';
-import { resolveService } from './context.js';
+import { clip, relevance } from './evidence.js';
+import { resolveService, sessionContext } from './context.js';
 
 export const GUIDANCE = [
   'Praxis 是宿主内的任务与经验台账（工具 praxis_task 与 praxis_lesson）。',
@@ -8,8 +8,9 @@ export const GUIDANCE = [
   '2) 动手改代码前，先调查现有实现，用 need/inventory 记录复用、扩展或新增的判断连同证据（文件:行号、命令与关键输出）；弱证据会被拒绝。',
   '3) 声称完成或修复前，把真实验证结果用 verify 映射到验收项；passed 必须引用宿主记录的观察 ID。',
   '4) 验证之后又改文件，先前验证会失效，需要重新验证。',
-  '5) 等待人工验收用 close(partial, complete, awaiting_manual)，不要谎报 done。',
-  '6) 经验只在能给出可复核证据时才保存；检索到的经验是调查线索，不是当前事实。',
+  '5) 跑完最后一轮测试就当场 verify 并 close，不要攒到下一轮：会话可能在你收尾之前结束。',
+  '6) 等待人工验收用 close(partial, complete, awaiting_manual)，不要谎报 done。',
+  '7) 经验只在能给出可复核证据时才保存；检索到的经验是调查线索，不是当前事实。',
 ].join('\n');
 
 export const REMINDER =
@@ -96,8 +97,23 @@ function openTaskOf(state, sessionId) {
   return state.tasks.find((task) => task && task.status === 'open' && task.sessionId === sessionId) ?? null;
 }
 
+/** 最近一条能直接当通过证据的观察：提醒里给出 ID，模型就不必再翻 status 找它。 */
+function usableEvidenceOf(state, task) {
+  const usable = (state?.observations ?? []).filter(
+    (item) =>
+      item &&
+      item.taskId === task.id &&
+      item.sessionId === task.sessionId &&
+      item.outcome === 'success' &&
+      typeof item.resultSummary === 'string' &&
+      item.resultSummary !== '' &&
+      ['test', 'lint', 'build'].includes(item.kind),
+  );
+  return usable.length > 0 ? usable[usable.length - 1] : null;
+}
+
 /** 只做粗略诊断：具体门槛由 praxis_task close 判定，这里用于决定是否提醒。 */
-function closureGaps(task) {
+function closureGaps(task, state) {
   const gaps = [];
   if (task.phase !== 'verify') gaps.push(`仍在 ${task.phase} 阶段`);
   const active = (task.acceptance ?? []).filter((item) => item.active);
@@ -105,7 +121,14 @@ function closureGaps(task) {
   const passed = (task.verificationHistory ?? []).some(
     (item) => item && item.level === 'passed' && item.valid !== false,
   );
-  if (!passed) gaps.push('没有有效的通过验证');
+  if (!passed) {
+    const evidence = usableEvidenceOf(state, task);
+    gaps.push(
+      evidence
+        ? `没有有效的通过验证（已有可用证据 ${evidence.id}：${clip(evidence.resultSummary, 80)}，verify 直接引用即可）`
+        : '没有有效的通过验证',
+    );
+  }
   if ((task.pendingChangeIds ?? []).length > 0) {
     gaps.push(`有 ${task.pendingChangeIds.length} 条待复核写入`);
   }
@@ -118,6 +141,97 @@ function closureReminder(hint) {
     '如果这一轮确实完成了工作，用 praxis_task verify 引用观察 ID 后 close；',
     '如果还没完成，用 step 推进阶段或用 need 记录下一步，不要只在回复里口头收尾。',
   ].join('');
+}
+
+// 宁可漏提示，也不要每轮催检索：三个信号都不达标就不提，把调用机会留给模型自己判断。
+const LESSON_HINT_LIMIT = 2;
+const STRONG_TOKEN_MIN = 4;
+const CJK_RATIO_MIN = 0.2;
+const LEXICAL_MIN = 0.5;
+
+// 跨领域高频词，命中它们说明不了「相关」，只会制造噪声。
+const STOP_TOKENS = new Set([
+  'the', 'and', 'for', 'with', 'that', 'this', 'from', 'have', 'were', 'will', 'your', 'into',
+  'then', 'than', 'them', 'they', 'been', 'when', 'what', 'over', 'also', 'just', 'like', 'make',
+  'must', 'only', 'some', 'such', 'test', 'tests', 'code', 'file', 'files', 'node', 'npm', 'pnpm',
+  'http', 'https', 'true', 'false', 'null', 'undefined', 'function', 'const', 'return', 'await',
+  'async', 'case', 'default', 'value', 'string', 'number', 'object', 'array', 'this', 'type',
+]);
+
+// 同样跨领域的中文二元组：命中它们不代表任务和某条经验有关。
+const STOP_BIGRAMS = new Set([
+  '实现', '文件', '数据', '状态', '需要', '当前', '一个', '我们', '可以', '这个', '进行',
+  '使用', '处理', '问题', '并且', '不是', '已经', '任务', '记录', '之后', '然后', '如果',
+]);
+
+/** 英文标识符切成强词：整体保留，再按 . / : _ - 拆开，让 agent/pre-step 与 pre-step 互相可见。 */
+function strongTokens(text) {
+  const found = String(text ?? '').toLowerCase().match(/[a-z][a-z0-9_.:/-]{2,}/g) ?? [];
+  const tokens = new Set();
+  for (const token of found) {
+    if (token.length >= STRONG_TOKEN_MIN && !STOP_TOKENS.has(token)) tokens.add(token);
+    for (const part of token.split(/[./:_-]+/)) {
+      if (part.length >= STRONG_TOKEN_MIN && !STOP_TOKENS.has(part)) tokens.add(part);
+    }
+  }
+  return tokens;
+}
+
+/** 中文没有空格分词，用字面二元组重叠近似语义重合。 */
+function cjkBigrams(text) {
+  const runs = String(text ?? '').match(/[\u4e00-\u9fa5]+/g) ?? [];
+  const grams = new Set();
+  for (const run of runs) {
+    for (let index = 0; index + 2 <= run.length; index += 1) {
+      const gram = run.slice(index, index + 2);
+      if (!STOP_BIGRAMS.has(gram)) grams.add(gram);
+    }
+  }
+  return grams;
+}
+
+function overlapCount(left, right) {
+  let count = 0;
+  for (const item of left) {
+    if (right.has(item)) count += 1;
+  }
+  return count;
+}
+
+function lessonScore(text, lesson) {
+  const haystack = `${lesson.trigger ?? ''} ${lesson.lesson ?? ''}`;
+  const strongHits = overlapCount(strongTokens(text), strongTokens(haystack));
+  const grams = cjkBigrams(text);
+  const cjkRatio = grams.size === 0 ? 0 : overlapCount(grams, cjkBigrams(haystack)) / grams.size;
+  return { strongHits, cjkRatio, lexical: relevance(text, haystack) };
+}
+
+/** 只挑真的对得上的活跃经验；项目经验必须同项目，全局经验都可见。 */
+export function matchingLessons(state, projectKey, text) {
+  const lessons = Array.isArray(state?.lessons) ? state.lessons : [];
+  const hits = [];
+  for (const lesson of lessons) {
+    if (!lesson || lesson.status !== 'active') continue;
+    if (lesson.scope === 'project') {
+      if (!projectKey || lesson.projectKey !== projectKey) continue;
+    } else if (lesson.scope !== 'global') {
+      continue;
+    }
+    const score = lessonScore(text, lesson);
+    if (score.strongHits === 0 && score.cjkRatio < CJK_RATIO_MIN && score.lexical < LEXICAL_MIN) continue;
+    hits.push({ lesson, score: score.strongHits * 2 + score.cjkRatio + score.lexical });
+  }
+  hits.sort((a, b) => b.score - a.score);
+  return hits.slice(0, LESSON_HINT_LIMIT);
+}
+
+function lessonHintMessage(hits) {
+  const lines = hits.map((hit) => `- ${clip(hit.lesson.trigger ?? '（无触发条件）', 120)}（lesson_id ${hit.lesson.id}）`);
+  return [
+    '[Praxis] 错题本里有与本次任务措辞接近的经验，可以先用 praxis_lesson search 判断是否适用：',
+    ...lines,
+    '经验是过往证据，不等于当前事实；不适用就忽略，不要为了检索而检索。',
+  ].join('\n');
 }
 
 /** 接线失败时返回的 dispose 上带 degraded 字段，调用方据此报告降级而不是假装启用。 */
@@ -170,7 +284,33 @@ export function attachLifecycle(ctx, store) {
             }
           }
 
-          if (classifyRequest(lastUserText(payload.messages)) !== 'applicable') return next();
+          const requestText = lastUserText(payload.messages);
+          if (classifyRequest(requestText) !== 'applicable') return next();
+
+          // 相关经验：整个会话只提一次，且只在措辞真的对得上时才提。
+          const latest = await store.load();
+          if (!latest.sessions?.[sessionId]?.lessonHintShown) {
+            const { projectKey } = sessionContext(ctx, sessionId);
+            const hits = matchingLessons(latest, projectKey, requestText);
+            if (hits.length > 0) {
+              let planted = false;
+              await store.mutate((state) => {
+                const session = sessionOf(state, sessionId);
+                if (session.lessonHintShown) return;
+                session.lessonHintShown = true;
+                session.lessonHintCount = (session.lessonHintCount ?? 0) + 1;
+                session.lastReminderTurn = turn;
+                session.reminderCount = (session.reminderCount ?? 0) + 1;
+                planted = true;
+              });
+              if (planted) {
+                return {
+                  kind: 'enter',
+                  messages: [...(payload.messages ?? []), reminderMessage(lessonHintMessage(hits))],
+                };
+              }
+            }
+          }
 
           let inject = false;
           await store.mutate((state) => {
@@ -202,7 +342,7 @@ export function attachLifecycle(ctx, store) {
               session.closureHint = null;
               return;
             }
-            const detail = closureGaps(task);
+            const detail = closureGaps(task, state);
             session.closureHint = {
               taskId: task.id,
               pending: detail.length > 0,
