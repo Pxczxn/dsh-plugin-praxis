@@ -1,0 +1,4 @@
+# praxis: profile-level tool row. Does not touch agent presets.
+- insert:
+    - id: tool-praxis
+      name: dsh-plugin-praxis

@@ -1,0 +1,1326 @@
+// Praxis 规则引擎：状态机、验证绑定与失效、经验生命周期、幂等账本。
+// 只通过 store.mutate 做单事务写入；本文件不碰文件系统、不依赖 DSH。
+import { createHash } from 'node:crypto';
+import {
+  LIMITS,
+  PraxisError,
+  clip,
+  evidenceGaps,
+  evidenceStrength,
+  id,
+  nowIso,
+  relevance,
+  similarity,
+} from './evidence.js';
+
+export const PHASES = ['understand', 'implement', 'verify'];
+export const OUTCOMES = ['done', 'partial', 'abandoned'];
+export const IMPLEMENTATION_STATUS = ['unknown', 'complete', 'incomplete', 'not_applicable'];
+export const LEVELS = ['passed', 'partial', 'blocked', 'not_run'];
+export const CLOSURE_REASONS = [
+  'awaiting_manual',
+  'verification_missing',
+  'implementation_incomplete',
+  'other',
+];
+export const DECISIONS = ['reuse', 'extend', 'new'];
+export const TASK_ACTIONS = ['start', 'need', 'inventory', 'step', 'verify', 'close', 'status'];
+export const LESSON_ACTIONS = ['search', 'save', 'update', 'retire'];
+
+export const NEAR_DUPLICATE = 0.85;
+export const RELATED = 0.6;
+export const MAX_TASKS = 200;
+export const MAX_LESSONS = 400;
+export const MAX_EVENTS = 40;
+export const MAX_OBSERVATIONS = 1000;
+export const MAX_REQUESTS = 500;
+export const REPEAT_REWIND_AT = 3;
+
+const MUTATING_TASK_ACTIONS = new Set(['start', 'need', 'inventory', 'step', 'verify', 'close']);
+const MUTATING_LESSON_ACTIONS = new Set(['save', 'update', 'retire']);
+const EVIDENCE_KINDS = new Set(['test', 'build', 'lint']);
+
+function ok(data = {}, warnings = []) {
+  const response = { ok: true, code: 'ok', data };
+  if (warnings.length > 0) response.warnings = warnings;
+  return response;
+}
+
+function refusal(error) {
+  return {
+    ok: false,
+    code: error.code ?? 'invalid-state',
+    message: error.message,
+    hint: error.hint ?? null,
+    changed: error.changed === true,
+  };
+}
+
+function requiredString(args, field, limit = LIMITS.note) {
+  const value = args[field];
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new PraxisError('missing-field', `缺少必填字段 ${field}`, {
+      hint: `请提供非空的 ${field}`,
+    });
+  }
+  return clip(value.trim(), limit);
+}
+
+function optionalString(args, field, limit = LIMITS.note) {
+  const value = args[field];
+  if (value === undefined || value === null || value === '') return null;
+  return clip(String(value).trim(), limit);
+}
+
+function optionalArray(args, field) {
+  const value = args[field];
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) {
+    throw new PraxisError('bad-action', `${field} 必须是数组`, { hint: `请把 ${field} 传成数组` });
+  }
+  return value;
+}
+
+function oneOf(value, allowed, field) {
+  if (!allowed.includes(value)) {
+    throw new PraxisError('bad-action', `${field} 不合法：${value}`, {
+      hint: `允许值：${allowed.join(' | ')}`,
+    });
+  }
+  return value;
+}
+
+function findTask(state, taskId) {
+  const task = state.tasks.find((item) => item.id === taskId);
+  if (!task) {
+    throw new PraxisError('task-not-found', `找不到任务 ${taskId}`, {
+      hint: '先用 status 查看任务 ID；不存在的任务无法操作',
+    });
+  }
+  return task;
+}
+
+function ensureOpen(task) {
+  if (task.status === 'closed') {
+    throw new PraxisError('task-closed', `任务 ${task.id} 已关闭（${task.closedAs}）`, {
+      hint: '已关闭任务不可再修改；请创建新任务并用 parentTaskId 关联',
+    });
+  }
+  return task;
+}
+
+function pushEvent(task, kind, detail, at = nowIso()) {
+  task.events.push({ at, kind, detail: clip(detail, 300) });
+  while (task.events.length > MAX_EVENTS) {
+    task.events.shift();
+    task.omittedEventCount = (task.omittedEventCount ?? 0) + 1;
+  }
+}
+
+function touch(task, at = nowIso()) {
+  task.updatedAt = at;
+}
+
+function summarizeTask(task) {
+  return {
+    task_id: task.id,
+    goal: task.goal,
+    projectKey: task.projectKey,
+    phase: task.phase,
+    status: task.status,
+    revision: task.revision,
+    implementationStatus: task.implementationStatus,
+    reviewStatus: task.reviewStatus,
+    closedAs: task.closedAs,
+    closureReason: task.closureReason,
+    acceptance: task.acceptance.length,
+    needs: task.needs.length,
+    verifications: task.verificationHistory.length,
+    pendingChanges: task.pendingChangeIds.length,
+    updatedAt: task.updatedAt,
+  };
+}
+
+function summarizeLesson(lesson) {
+  return {
+    lesson_id: lesson.id,
+    scope: lesson.scope,
+    projectKey: lesson.projectKey,
+    trigger: lesson.trigger,
+    lesson: lesson.lesson,
+    evidence: lesson.evidence,
+    reusable_because: lesson.reusable_because,
+    tags: lesson.tags,
+    source_task: lesson.source_task,
+    supersedes: lesson.supersedes,
+    supersededBy: lesson.supersededBy,
+    status: lesson.status,
+    createdAt: lesson.createdAt,
+    updatedAt: lesson.updatedAt,
+  };
+}
+
+function normalizeAcceptance(items, existing = [], warnings = []) {
+  const result = existing.map((item) => ({ ...item }));
+  for (const raw of items) {
+    if (!raw || typeof raw !== 'object') {
+      throw new PraxisError('bad-action', 'acceptance 项必须是对象', {
+        hint: '每项至少提供 text；可用 id 指定要更新的验收项',
+      });
+    }
+    const text = typeof raw.text === 'string' ? clip(raw.text.trim(), LIMITS.acceptance) : null;
+    const explicitId = typeof raw.id === 'string' && raw.id.trim() !== '' ? raw.id.trim() : null;
+    if (explicitId) {
+      const target = result.find((item) => item.id === explicitId);
+      if (!target) {
+        if (!text) {
+          throw new PraxisError('missing-field', `新验收项 ${explicitId} 缺少 text`, {
+            hint: '新验收项必须给出 text',
+          });
+        }
+        result.push({
+          id: clip(explicitId, 80),
+          text,
+          source: oneOf(raw.source ?? 'agent_proposed', ['user_explicit', 'agent_proposed'], 'source'),
+          kind: oneOf(raw.kind ?? 'automated', ['automated', 'manual'], 'kind'),
+          active: raw.active !== false,
+        });
+        continue;
+      }
+      if (text !== null) target.text = text;
+      if (raw.source !== undefined) {
+        target.source = oneOf(raw.source, ['user_explicit', 'agent_proposed'], 'source');
+      }
+      if (raw.kind !== undefined) target.kind = oneOf(raw.kind, ['automated', 'manual'], 'kind');
+      if (raw.active !== undefined) target.active = raw.active !== false;
+      continue;
+    }
+    if (!text) {
+      throw new PraxisError('missing-field', 'acceptance 项缺少 text', {
+        hint: '每项至少提供 text；已存在的项请带 id',
+      });
+    }
+    const nextNumber = result.length + 1;
+    let newId = `criterion-${nextNumber}`;
+    while (result.some((item) => item.id === newId)) newId = `${newId}x`;
+    result.push({
+      id: newId,
+      text,
+      source: oneOf(raw.source ?? 'agent_proposed', ['user_explicit', 'agent_proposed'], 'source'),
+      kind: oneOf(raw.kind ?? 'automated', ['automated', 'manual'], 'kind'),
+      active: raw.active !== false,
+    });
+  }
+  return result;
+}
+
+function acceptanceChanges(before, after) {
+  const changes = [];
+  const byId = new Map(before.map((item) => [item.id, item]));
+  for (const item of after) {
+    const old = byId.get(item.id);
+    if (!old) {
+      changes.push({ kind: 'added', id: item.id, text: item.text });
+      continue;
+    }
+    if (old.text !== item.text) changes.push({ kind: 'text_changed', id: item.id, from: old.text, to: item.text });
+    if (old.source !== item.source) changes.push({ kind: 'source_changed', id: item.id, from: old.source, to: item.source });
+    if (old.kind !== item.kind) changes.push({ kind: 'kind_changed', id: item.id, from: old.kind, to: item.kind });
+    if (old.active !== item.active) changes.push({ kind: item.active ? 'reactivated' : 'deactivated', id: item.id });
+  }
+  const afterIds = new Set(after.map((item) => item.id));
+  for (const item of before) {
+    if (!afterIds.has(item.id)) changes.push({ kind: 'removed', id: item.id, text: item.text });
+  }
+  return changes;
+}
+
+function invalidate(task, at, reason) {
+  let invalidated = 0;
+  for (const verification of task.verificationHistory) {
+    if (verification.valid && verification.revision < task.revision) {
+      verification.valid = false;
+      invalidated += 1;
+    }
+  }
+  if (invalidated > 0) pushEvent(task, 'invalidate', `${reason}；${invalidated} 条旧验证失效`, at);
+  return invalidated;
+}
+
+function pickObservations(state, ctx, task, ids) {
+  const picked = [];
+  for (const observationId of ids) {
+    const observation = state.observations.find((item) => item.id === observationId);
+    if (!observation) {
+      throw new PraxisError('observation-not-found', `观察 ${observationId} 不存在`, {
+        hint: '只接受宿主 tools/result 生成、且仍保留在状态文件中的观察 ID',
+      });
+    }
+    if (observation.sessionId !== ctx.sessionId) {
+      throw new PraxisError('observation-not-found', `观察 ${observationId} 不属于当前会话`, {
+        hint: '跨会话观察不能用于本任务验证',
+      });
+    }
+    if (observation.taskId !== task.id) {
+      throw new PraxisError('ambiguous-owner', `观察 ${observationId} 未绑定到任务 ${task.id}`, {
+        hint: '只有捕获时唯一确定归属的观察才能作为验证证据；模糊归属只允许只读诊断',
+      });
+    }
+    if (!picked.some((item) => item.id === observation.id)) picked.push(observation);
+  }
+  return picked;
+}
+
+function observationRejection(observation) {
+  if (observation.outcome !== 'success') return '工具执行失败';
+  if (!EVIDENCE_KINDS.has(observation.kind)) {
+    return `工具类型 ${observation.kind} 只能作过程证据，不能作为验收证明`;
+  }
+  if (!observation.resultSummary) return '缺少可复核的结果摘要';
+  return null;
+}
+
+function coverageRows(task, coverage) {
+  if (!Array.isArray(coverage) || coverage.length === 0) {
+    throw new PraxisError('missing-field', 'coverage 不能为空', {
+      hint: '每项验收目标都要给出 result；passed 需要引用通过检查的观察 ID',
+    });
+  }
+  const active = new Map(task.acceptance.filter((item) => item.active).map((item) => [item.id, item]));
+  return coverage.map((raw) => {
+    const criterionId = typeof raw?.criterionId === 'string' ? raw.criterionId : '';
+    if (!active.has(criterionId)) {
+      throw new PraxisError('acceptance-uncovered', `验收项 ${criterionId || '(空)'} 不存在或已停用`, {
+        hint: 'coverage 必须指向当前活跃的验收项',
+      });
+    }
+    const result = oneOf(raw.result, LEVELS, 'coverage.result');
+    const observationIds = Array.isArray(raw.observationIds) ? raw.observationIds.map(String) : [];
+    return {
+      criterionId,
+      result,
+      observationIds,
+      note: optionalString(raw, 'note', LIMITS.note),
+    };
+  });
+}
+
+function verifiedAcceptanceIds(task) {
+  const current = task.verificationHistory.filter(
+    (item) => item.valid && item.revision === task.revision,
+  );
+  const passed = new Map();
+  for (const verification of current) {
+    for (const row of verification.coverage) {
+      if (row.result === 'passed' && row.observationIds.length > 0) {
+        passed.set(row.criterionId, verification);
+      }
+    }
+  }
+  return passed;
+}
+
+function digestArgs(args) {
+  const clone = {};
+  for (const key of Object.keys(args).sort()) {
+    if (key === 'request_id') continue;
+    clone[key] = args[key];
+  }
+  return createHash('sha256').update(JSON.stringify(clone)).digest('hex');
+}
+
+function requestKey(ctx, action, requestId) {
+  return [
+    ctx.sessionId ?? 'no-session',
+    ctx.projectKey ?? 'no-project',
+    action,
+    requestId,
+  ].join('|');
+}
+
+function replay(state, ctx, action, args) {
+  const requestId = args.request_id;
+  if (typeof requestId !== 'string' || requestId.trim() === '') return null;
+  const key = requestKey(ctx, action, requestId.trim());
+  const record = state.requests.find((item) => item.key === key);
+  if (!record) return null;
+  const digest = digestArgs(args);
+  if (record.payloadDigest !== digest) {
+    throw new PraxisError('idempotency-conflict', '同一 request_id 携带了不同参数', {
+      hint: '换一个 request_id，或原样重试同一组参数',
+    });
+  }
+  const snapshot = record.resultRef ? JSON.parse(record.resultRef) : { replay_of: record.ref };
+  // 重放必须返回与首次相同的响应形状，调用方才能无差别解析。
+  return { ok: true, code: 'ok', data: { ...snapshot, replayed: true }, replayed: true };
+}
+
+function remember(state, ctx, action, args, response) {
+  const requestId = args.request_id;
+  if (typeof requestId !== 'string' || requestId.trim() === '') return;
+  const key = requestKey(ctx, action, requestId.trim());
+  state.requests.push({
+    key,
+    payloadDigest: digestArgs(args),
+    resultRef: clip(JSON.stringify(response.data ?? {}), 8000),
+    ref: response.data?.task_id ?? response.data?.lesson_id ?? null,
+    at: nowIso(),
+  });
+  while (state.requests.length > MAX_REQUESTS) state.requests.shift();
+}
+
+function acceptanceView(task) {
+  const passed = verifiedAcceptanceIds(task);
+  return task.acceptance.map((item) => ({
+    id: item.id,
+    text: item.text,
+    source: item.source,
+    kind: item.kind,
+    active: item.active,
+    covered: item.active ? passed.has(item.id) : null,
+  }));
+}
+
+function verificationState(verification, task) {
+  if (!verification.valid) return 'invalidated';
+  if (verification.revision !== task.revision) return 'stale';
+  return 'current';
+}
+
+function applyConfirmedWrite(task, observation) {
+  task.revision += 1;
+  const at = observation.at;
+  invalidate(task, at, `观察到已确认实现写入 ${observation.id}`);
+  touch(task, at);
+}
+
+function applyPossibleWrite(task, observation) {
+  if (!task.pendingChangeIds.includes(observation.id)) task.pendingChangeIds.push(observation.id);
+  task.reviewStatus = 'unverified';
+  pushEvent(task, 'invalidate', `观察到可能写入 ${observation.id}，等待复验`, observation.at);
+  touch(task, observation.at);
+}
+
+export function createEngine(store) {
+  async function write(fn) {
+    let response;
+    await store.mutate((state) => {
+      response = fn(state);
+    });
+    return response;
+  }
+
+  async function read(fn) {
+    const state = await store.load();
+    return fn(state);
+  }
+
+  // ---------- 任务动作 ----------
+
+  function start(ctx, state, args) {
+    const goal = requiredString(args, 'goal', LIMITS.goal);
+    if (state.tasks.length >= MAX_TASKS) {
+      const reclaimable = state.tasks.filter(
+        (task) => task.status === 'closed' && task.lessons.length === 0,
+      ).length;
+      throw new PraxisError('capacity', '任务数量达到上限', {
+        hint: reclaimable > 0 ? '存在可回收的已关闭任务；当前版本不自动删除，请清理状态文件后重试' : '请先清理已关闭任务',
+      });
+    }
+    const parentTaskId = optionalString(args, 'parentTaskId', 80);
+    if (parentTaskId) {
+      const parent = findTask(state, parentTaskId);
+      if (parent.status === 'closed') {
+        throw new PraxisError('task-closed', `父任务 ${parent.id} 已关闭`, {
+          hint: '父任务关闭后不可再作为父任务；请直接创建独立任务',
+        });
+      }
+    }
+    const acceptance = args.acceptance === undefined
+      ? []
+      : normalizeAcceptance(optionalArray(args, 'acceptance') ?? []);
+    const at = nowIso();
+    const task = {
+      id: id(),
+      goal,
+      projectKey: optionalString(args, 'projectKey', LIMITS.projectKey) ?? ctx.projectKey ?? null,
+      sessionId: ctx.sessionId ?? null,
+      parentTaskId: parentTaskId ?? null,
+      phase: 'understand',
+      status: 'open',
+      revision: 0,
+      implementationStatus: 'unknown',
+      reviewStatus: 'unverified',
+      acceptance,
+      needs: [],
+      verificationHistory: [],
+      corrections: [],
+      lessons: [],
+      events: [],
+      omittedEventCount: 0,
+      pendingChangeIds: [],
+      closedAs: null,
+      closureReason: null,
+      createdAt: at,
+      updatedAt: at,
+    };
+    pushEvent(task, 'start', clip(goal, 200), at);
+    state.tasks.push(task);
+    const warnings = [];
+    if (acceptance.length === 0) {
+      warnings.push('尚未登记验收项；没有活跃验收项时不能 close(done)');
+    }
+    return ok({ task_id: task.id, task: summarizeTask(task), acceptance: acceptanceView(task) }, warnings);
+  }
+
+  function need(ctx, state, args) {
+    const task = ensureOpen(findTask(state, requiredString(args, 'task_id', 80)));
+    if (task.phase === 'verify') {
+      throw new PraxisError('invalid-state', 'verify 阶段不能更新调查判断', {
+        hint: '先用 step 回退到 implement 或 understand，再更新 need',
+      });
+    }
+    const target = requiredString(args, 'target', LIMITS.target);
+    const decision = oneOf(requiredString(args, 'decision', 20), DECISIONS, 'decision');
+    const evidence = requiredString(args, 'evidence', LIMITS.evidence);
+    const strength = evidenceStrength(evidence);
+    if (strength === 'none') {
+      throw new PraxisError('weak-evidence', '调查依据为空', { hint: '给出文件:行号、执行的命令与关键输出' });
+    }
+    const observationIds = optionalArray(args, 'observationIds') ?? [];
+    pickObservations(state, ctx, task, observationIds);
+    const plan = optionalString(args, 'plan', LIMITS.plan);
+    const at = nowIso();
+    const row = {
+      target,
+      decision,
+      evidence,
+      evidenceStrength: strength,
+      observationIds,
+      plan,
+      at,
+    };
+    const existing = task.needs.find((item) => item.target === target);
+    const warnings = [];
+    if (strength === 'weak') {
+      warnings.push(`调查依据缺少可核对结果：${evidenceGaps(evidence).join('；')}`);
+    }
+    if (existing) {
+      existing.revisions = existing.revisions ?? [];
+      existing.revisions.push({
+        at: existing.at,
+        decision: existing.decision,
+        evidence: existing.evidence,
+        plan: existing.plan,
+      });
+      Object.assign(existing, row);
+      warnings.push(`目标 ${target} 的调查判断已更新，旧判断保留在 revisions 中`);
+    } else {
+      task.needs.push(row);
+    }
+    if (task.phase === 'implement') {
+      task.revision += 1;
+      invalidate(task, at, '调查判断有实质修改');
+    }
+    pushEvent(task, 'need', `${decision} ${target}（${strength}）`, at);
+    touch(task, at);
+    return ok(
+      { task_id: task.id, need: row, revision: task.revision, needs: task.needs },
+      warnings,
+    );
+  }
+
+  function inventory(ctx, state, args) {
+    const task = ensureOpen(findTask(state, requiredString(args, 'task_id', 80)));
+    const rawNeeds = optionalArray(args, 'needs');
+    const rawAcceptance = optionalArray(args, 'acceptance');
+    if (!rawNeeds?.length && !rawAcceptance?.length) {
+      throw new PraxisError('missing-field', 'inventory 至少需要 needs 或 acceptance 之一', {
+        hint: '批量补充调查结论或验收项',
+      });
+    }
+    const changeReason = optionalString(args, 'change_reason', LIMITS.reason);
+    const at = nowIso();
+    const warnings = [];
+    if (rawAcceptance && task.phase === 'verify') {
+      throw new PraxisError('invalid-state', 'verify 阶段不能直接修改验收项', {
+        hint: '先用 step 回退到 implement/understand；修改会登记理由并使旧验证失效',
+      });
+    }
+    if (rawNeeds && task.phase === 'verify') {
+      throw new PraxisError('invalid-state', 'verify 阶段不能修改调查判断', {
+        hint: '先 step 回退，再更新 needs',
+      });
+    }
+    let changed = false;
+    if (rawNeeds) {
+      for (const raw of rawNeeds) {
+        const target = requiredString(raw ?? {}, 'target', LIMITS.target);
+        const decision = oneOf(requiredString(raw, 'decision', 20), DECISIONS, 'decision');
+        const evidence = requiredString(raw, 'evidence', LIMITS.evidence);
+        const strength = evidenceStrength(evidence);
+        if (strength === 'none') {
+          throw new PraxisError('weak-evidence', `目标 ${target} 的调查依据为空`);
+        }
+        if (strength === 'weak') warnings.push(`目标 ${target} 只有格式弱证据`);
+        const observationIds = Array.isArray(raw.observationIds) ? raw.observationIds.map(String) : [];
+        if (observationIds.length > 0) pickObservations(state, ctx, task, observationIds);
+        const row = {
+          target,
+          decision,
+          evidence,
+          evidenceStrength: strength,
+          observationIds,
+          plan: optionalString(raw, 'plan', LIMITS.plan),
+          at,
+        };
+        const existing = task.needs.find((item) => item.target === target);
+        if (existing) {
+          existing.revisions = existing.revisions ?? [];
+          existing.revisions.push({
+            at: existing.at,
+            decision: existing.decision,
+            evidence: existing.evidence,
+            plan: existing.plan,
+          });
+          Object.assign(existing, row);
+        } else {
+          task.needs.push(row);
+        }
+        changed = true;
+      }
+    }
+    if (rawAcceptance) {
+      const before = task.acceptance;
+      const after = normalizeAcceptance(rawAcceptance, before);
+      const changes = acceptanceChanges(before, after);
+      if (changes.length > 0) {
+        if (!changeReason) {
+          throw new PraxisError('missing-field', '修改验收项必须提供 change_reason', {
+            hint: '说明为何新增、停用或调整验收项；不能通过删除未通过项绕过 close(done)',
+          });
+        }
+        task.acceptance = after;
+        changed = true;
+        pushEvent(task, 'advance', `验收项变更：${clip(JSON.stringify(changes), 240)}`, at);
+      }
+    }
+    if (changed && task.phase === 'implement') {
+      task.revision += 1;
+      invalidate(task, at, '验收项或调查判断有实质修改');
+    }
+    if (changeReason) pushEvent(task, 'advance', `inventory：${changeReason}`, at);
+    touch(task, at);
+    return ok(
+      {
+        task_id: task.id,
+        needs: task.needs,
+        acceptance: acceptanceView(task),
+        revision: task.revision,
+      },
+      warnings,
+    );
+  }
+
+  function step(ctx, state, args) {
+    const task = ensureOpen(findTask(state, requiredString(args, 'task_id', 80)));
+    const phase = oneOf(requiredString(args, 'phase', 20), PHASES, 'phase');
+    const note = optionalString(args, 'note', LIMITS.note);
+    const at = nowIso();
+    const warnings = [];
+    if (task.phase === phase) {
+      return ok({ task: summarizeTask(task), acceptance: acceptanceView(task) }, ['already in phase']);
+    }
+    const forward = PHASES.indexOf(phase) > PHASES.indexOf(task.phase);
+    const allowed = {
+      understand: ['implement', 'verify'],
+      implement: ['verify', 'understand'],
+      verify: ['implement', 'understand'],
+    };
+    if (!allowed[task.phase].includes(phase)) {
+      throw new PraxisError('invalid-state', `不允许从 ${task.phase} 转到 ${phase}`, {
+        hint: `当前仅允许：${allowed[task.phase].join(' | ')}`,
+      });
+    }
+    if (phase === 'implement' && task.phase === 'understand') {
+      const concrete = task.needs.some((item) => item.evidenceStrength === 'concrete');
+      if (!concrete) {
+        throw new PraxisError('gate', '进入实现前缺少具体调查依据', {
+          hint: '至少一条 need 需要给出文件:行号、命令与关键输出等可核对依据；弱证据不能通过',
+        });
+      }
+      task.revision += 1;
+      invalidate(task, at, '进入实现阶段');
+    }
+    if (phase === 'verify' && task.phase === 'understand') {
+      if (task.acceptance.filter((item) => item.active).length === 0) {
+        throw new PraxisError('gate', '没有活跃验收项，不能进入验证', {
+          hint: '用 inventory 登记可判定的验收项',
+        });
+      }
+      if (!note) {
+        throw new PraxisError('missing-field', '从 understand 直接进入 verify 需要说明为何无需实现', {
+          hint: '在 note 中写明跳过实现的原因，并确保验收项可判定',
+        });
+      }
+      warnings.push('跳过实现阶段；请确认该任务确实无需代码改动');
+    }
+    if (phase === 'verify' && task.phase === 'implement') {
+      if (task.acceptance.filter((item) => item.active).length === 0) {
+        throw new PraxisError('gate', '没有活跃验收项，不能进入验证', {
+          hint: '用 inventory 登记可判定的验收项',
+        });
+      }
+    }
+    if (!forward) {
+      if (!note) {
+        throw new PraxisError('missing-field', '回退阶段必须说明理由（note）', {
+          hint: '记录回退原因，便于自校正与审计',
+        });
+      }
+      task.corrections.push({ at, from: task.phase, to: phase, reason: note });
+      task.revision += 1;
+      invalidate(task, at, `回退到 ${phase}：${note}`);
+      if (task.corrections.length >= REPEAT_REWIND_AT) {
+        warnings.push(`本任务已回退 ${task.corrections.length} 次；请检查是否存在需求理解不足或验证范围错误`);
+      }
+    }
+    task.phase = phase;
+    pushEvent(task, forward ? 'advance' : 'rewind', `${task.phase}${note ? `：${note}` : ''}`, at);
+    touch(task, at);
+    return ok({ task: summarizeTask(task), acceptance: acceptanceView(task) }, warnings);
+  }
+
+  function verify(ctx, state, args) {
+    const task = ensureOpen(findTask(state, requiredString(args, 'task_id', 80)));
+    const level = oneOf(requiredString(args, 'level', 20), LEVELS, 'level');
+    const scope = requiredString(args, 'scope', LIMITS.scope);
+    if (task.phase === 'understand') {
+      throw new PraxisError('invalid-state', 'understand 阶段不能执行验证', {
+        hint: '先 step 到 implement；或对无需实现的任务 step 到 verify',
+      });
+    }
+    const coverage = coverageRows(task, args.coverage);
+    const at = nowIso();
+    const warnings = [];
+
+    if (level === 'passed' && coverage.some((row) => row.result !== 'passed')) {
+      throw new PraxisError('invalid-state', 'level=passed 与覆盖结果矛盾', {
+        hint: '任一验收项不是 passed 时，level 只能是 partial 或 blocked',
+      });
+    }
+    if (level === 'passed' && !coverage.every((row) => row.observationIds.length > 0)) {
+      throw new PraxisError('unverified', 'passed 验证的每一项都必须引用可信观察', {
+        hint: '先运行可观察的检查（测试/构建/lint），再用 status 取得候选观察 ID',
+      });
+    }
+    if (level === 'not_run' && !optionalString(args, 'note', LIMITS.note)) {
+      throw new PraxisError('missing-field', 'not_run 需要说明为什么没有运行', { hint: '在 note 中写明原因' });
+    }
+
+    const allObservations = [];
+    const perRow = [];
+    for (const row of coverage) {
+      const observations = pickObservations(state, ctx, task, row.observationIds);
+      if (row.result === 'passed') {
+        if (observations.length === 0) {
+          throw new PraxisError('unverified', `验收项 ${row.criterionId} 缺少观察证据`);
+        }
+        const rejected = observations.map((item) => ({ item, reason: observationRejection(item) }));
+        const usable = rejected.filter((entry) => entry.reason === null);
+        if (usable.length === 0) {
+          throw new PraxisError('unverified', `验收项 ${row.criterionId} 的观察不能证明检查通过`, {
+            hint: rejected.map((entry) => `${entry.item.id}: ${entry.reason}`).join('；'),
+          });
+        }
+      }
+      for (const item of observations) {
+        if (!allObservations.some((entry) => entry.id === item.id)) allObservations.push(item);
+      }
+      perRow.push(row);
+    }
+
+    const evidence = optionalString(args, 'evidence', LIMITS.evidence);
+    const strength = evidence ? evidenceStrength(evidence) : 'none';
+    if (strength === 'weak') warnings.push(`验证说明只有格式弱证据：${evidenceGaps(evidence).join('；')}`);
+    const provenance = allObservations.length > 0 ? 'observed' : 'self_reported';
+    if (provenance === 'self_reported') {
+      warnings.push('本次验证没有引用宿主观察；它不能独立支持 close(done)');
+    }
+
+    const revision = task.revision;
+    const verification = {
+      id: id(),
+      level,
+      scope,
+      coverage: perRow,
+      evidence: evidence ?? '',
+      evidenceStrength: strength,
+      provenance,
+      observationIds: allObservations.map((item) => item.id),
+      revision,
+      valid: true,
+      note: optionalString(args, 'note', LIMITS.note),
+      at,
+    };
+    task.verificationHistory.push(verification);
+    if (task.phase === 'implement') {
+      task.phase = 'verify';
+      pushEvent(task, 'advance', '验证成功后进入 verify', at);
+    }
+    pushEvent(task, 'verify', `${level}（${provenance}）`, at);
+    touch(task, at);
+
+    const nextHint = level === 'passed'
+      ? '确认未覆盖验收项与待复核写入后，可尝试 close(done)'
+      : '记录问题并考虑 step 回退修复；不要用 remove 验收项绕过门槛';
+    return ok(
+      {
+        task_id: task.id,
+        verification_id: verification.id,
+        level,
+        provenance,
+        revision,
+        coverage: perRow,
+        acceptance: acceptanceView(task),
+        next_hint: nextHint,
+      },
+      warnings,
+    );
+  }
+
+  function readiness(task) {
+    const blockers = [];
+    if (task.phase !== 'verify') blockers.push(`任务处于 ${task.phase}，未进入 verify`);
+    if (task.implementationStatus !== 'complete') {
+      blockers.push(`implementationStatus=${task.implementationStatus}，done 需要 complete`);
+    }
+    const active = task.acceptance.filter((item) => item.active);
+    if (active.length === 0) blockers.push('没有活跃验收项');
+    const manual = active.filter((item) => item.kind === 'manual');
+    if (manual.length > 0) blockers.push(`存在人工验收项，无法由模型自述完成：${manual.map((item) => item.id).join(', ')}`);
+    if (task.pendingChangeIds.length > 0) {
+      blockers.push(`存在未解除的可能写入：${task.pendingChangeIds.join(', ')}`);
+    }
+    const passed = verifiedAcceptanceIds(task);
+    const uncovered = active.filter((item) => !passed.has(item.id)).map((item) => item.id);
+    if (uncovered.length > 0) blockers.push(`未由当前 revision 复验覆盖：${uncovered.join(', ')}`);
+    const stale = task.verificationHistory.filter(
+      (item) => item.valid && item.revision !== task.revision,
+    );
+    if (stale.length > 0) blockers.push(`存在 revision 不匹配的验证：${stale.length} 条`);
+    return { blockers, uncovered, manual: manual.map((item) => item.id) };
+  }
+
+  function close(ctx, state, args) {
+    const task = ensureOpen(findTask(state, requiredString(args, 'task_id', 80)));
+    const outcome = oneOf(requiredString(args, 'outcome', 20), OUTCOMES, 'outcome');
+    const implementationStatus = oneOf(
+      requiredString(args, 'implementationStatus', 30),
+      IMPLEMENTATION_STATUS,
+      'implementationStatus',
+    );
+    const closureReason = args.closureReason === undefined
+      ? null
+      : oneOf(args.closureReason, CLOSURE_REASONS, 'closureReason');
+    const note = optionalString(args, 'note', LIMITS.note);
+    const at = nowIso();
+    const warnings = [];
+    // 结项时提交的实施状态才是任务的最终状态；done 门槛检查的就是它。
+    task.implementationStatus = implementationStatus;
+
+    if (outcome === 'done') {
+      const { blockers } = readiness(task);
+      if (blockers.length > 0) {
+        throw new PraxisError('gate', '不满足 close(done) 门槛', {
+          hint: blockers.join('；'),
+        });
+      }
+    } else {
+      if (!closureReason) {
+        throw new PraxisError('missing-field', `${outcome} 结项必须提供 closureReason`, {
+          hint: `允许值：${CLOSURE_REASONS.join(' | ')}`,
+        });
+      }
+      if (outcome === 'abandoned' && !note) {
+        throw new PraxisError('missing-field', 'abandoned 需要说明终止原因（note）');
+      }
+      if (outcome === 'partial' && implementationStatus === 'complete' && closureReason !== 'awaiting_manual') {
+        warnings.push('实施已完成但以 partial 结项，请确认 closureReason 准确描述了剩余事项');
+      }
+    }
+
+    let lesson = null;
+    const lessonInput = args.lesson;
+    const lessonId = args.lesson_id;
+    if (lessonInput !== undefined && lessonId !== undefined) {
+      throw new PraxisError('bad-action', 'close 只能携带 lesson 或 lesson_id 之一', {
+        hint: '新建经验用 lesson；关联已有经验用 lesson_id',
+      });
+    }
+    if (lessonInput !== undefined) {
+      lesson = saveLessonInState(ctx, state, { ...lessonInput, source_task: task.id }, { sourceSnapshot: snapshot(task) });
+      task.lessons.push(lesson.lesson.id);
+      warnings.push(...lesson.warnings);
+    } else if (lessonId !== undefined) {
+      const target = state.lessons.find((item) => item.id === lessonId);
+      if (!target) throw new PraxisError('lesson-not-found', `找不到经验 ${lessonId}`);
+      if (target.status !== 'active') {
+        throw new PraxisError('invalid-state', `经验 ${lessonId} 当前状态为 ${target.status}`, {
+          hint: '只有 active 经验可以关联到任务',
+        });
+      }
+      if (target.scope === 'project' && target.projectKey !== task.projectKey) {
+        throw new PraxisError('conflict', '项目经验与任务项目不一致', { hint: '跨项目经验不能关联到本任务' });
+      }
+      if (!task.lessons.includes(target.id)) task.lessons.push(target.id);
+    }
+
+    task.status = 'closed';
+    task.closedAs = outcome;
+    task.closureReason = closureReason;
+    task.reviewStatus = outcome === 'done' ? 'verified' : 'unverified';
+    if (note) task.closureNote = note;
+    pushEvent(task, 'close', `${outcome}${closureReason ? ` / ${closureReason}` : ''}`, at);
+    touch(task, at);
+
+    const data = {
+      task_id: task.id,
+      outcome,
+      implementationStatus,
+      reviewStatus: task.reviewStatus,
+      task: summarizeTask(task),
+      acceptance: acceptanceView(task),
+    };
+    if (lesson) data.lesson = lesson.lesson;
+    if (outcome !== 'done') {
+      data.next_hint = outcome === 'partial'
+        ? 'partial 表示仍有未完成或待人工确认事项；不能当作 done'
+        : '任务已终止，后续需要重新开始时请创建新任务';
+    }
+    return ok(data, warnings);
+  }
+
+  function snapshot(task) {
+    const lastVerification = task.verificationHistory[task.verificationHistory.length - 1] ?? null;
+    return {
+      task_id: task.id,
+      goal: task.goal,
+      projectKey: task.projectKey,
+      phase: task.phase,
+      implementationStatus: task.implementationStatus,
+      lastVerification: lastVerification
+        ? { level: lastVerification.level, revision: lastVerification.revision, at: lastVerification.at }
+        : null,
+      at: nowIso(),
+    };
+  }
+
+  function status(ctx, state, args) {
+    const taskId = optionalString(args, 'task_id', 80);
+    const degraded = [];
+    if (state.droppedObservations > 0) degraded.push(`已丢弃 ${state.droppedObservations} 条超出容量的观察`);
+    if (state.observerErrors > 0) degraded.push(`观察采集失败 ${state.observerErrors} 次`);
+    if (!taskId) {
+      const open = state.tasks.filter((task) => task.status === 'open');
+      return ok({
+        tasks: open.map(summarizeTask),
+        totalTasks: state.tasks.length,
+        closedTasks: state.tasks.length - open.length,
+        lessons: state.lessons.filter((item) => item.status === 'active').length,
+        observations: state.observations.length,
+        degraded,
+      });
+    }
+    const task = findTask(state, taskId);
+    const limit = Math.min(Math.max(Number(args.observation_limit) || 10, 1), 50);
+    const cursor = Math.max(Number(args.observation_cursor) || 0, 0);
+    const candidates = state.observations
+      .filter((item) => item.sessionId === ctx.sessionId)
+      .filter((item) => item.taskId === null || item.taskId === task.id)
+      .sort((a, b) => b.sequence - a.sequence);
+    const page = candidates.slice(cursor, cursor + limit).map((item) => {
+      const reason = observationRejection(item);
+      return {
+        id: item.id,
+        sequence: item.sequence,
+        tool: item.tool,
+        kind: item.kind,
+        callSummary: item.callSummary,
+        outcome: item.outcome,
+        taskId: item.taskId,
+        at: item.at,
+        changeImpact: item.changeImpact,
+        usableForVerification: item.taskId === task.id && reason === null,
+        rejectedReason: item.taskId === task.id ? reason : '捕获时未绑定到本任务（仅诊断）',
+      };
+    });
+    const verificationViews = task.verificationHistory.map((item) => ({
+      id: item.id,
+      level: item.level,
+      revision: item.revision,
+      state: verificationState(item, task),
+      provenance: item.provenance,
+      at: item.at,
+      coverage: item.coverage,
+    }));
+    const { blockers, uncovered } = readiness(task);
+    return ok({
+      task: summarizeTask(task),
+      acceptance: acceptanceView(task),
+      uncovered,
+      blockers,
+      needs: task.needs,
+      corrections: task.corrections,
+      pendingChangeIds: task.pendingChangeIds,
+      verifications: verificationViews,
+      observations: page,
+      observationTotal: candidates.length,
+      next_cursor: cursor + limit < candidates.length ? cursor + limit : null,
+      degraded,
+    });
+  }
+
+  // ---------- 经验动作 ----------
+
+  function visibleLesson(ctx, state, args, lesson) {
+    if (lesson.status !== 'active') return false;
+    if (args.tag) {
+      const tag = String(args.tag).trim().toLowerCase();
+      if (!lesson.tags.some((item) => item.toLowerCase() === tag)) return false;
+    }
+    const scope = args.scope ?? null;
+    if (scope === 'global') return lesson.scope === 'global';
+    if (scope === 'project') {
+      const projectKey = args.projectKey ?? ctx.projectKey;
+      return lesson.scope === 'project' && lesson.projectKey === projectKey;
+    }
+    if (lesson.scope === 'global') return true;
+    const projectKey = args.projectKey ?? ctx.projectKey;
+    return lesson.scope === 'project' && lesson.projectKey === projectKey;
+  }
+
+  function search(ctx, state, args) {
+    const query = requiredString(args, 'query', LIMITS.query);
+    const limit = Math.min(Math.max(Number(args.limit) || 5, 1), 20);
+    const hits = state.lessons
+      .filter((lesson) => visibleLesson(ctx, state, args, lesson))
+      .map((lesson) => ({
+        lesson,
+        score: relevance(query, `${lesson.trigger} ${lesson.lesson} ${lesson.tags.join(' ')}`),
+      }))
+      .sort((a, b) => b.score - a.score || b.lesson.updatedAt.localeCompare(a.lesson.updatedAt))
+      .slice(0, limit)
+      .map(({ lesson, score }) => ({
+        ...summarizeLesson(lesson),
+        score: Number(score.toFixed(3)),
+        boundary: lesson.scope === 'global' ? '全局经验，需确认是否适用于当前项目' : `仅适用于 ${lesson.projectKey}`,
+      }));
+    return ok({
+      lessons: hits,
+      count: hits.length,
+      note: '历史经验是调查线索，不是当前项目的事实证据；采用前请重新核实',
+    });
+  }
+
+  function lessonCandidates(state, ctx, args, ignoreId = null) {
+    const projectKey = args.projectKey ?? ctx.projectKey;
+    return state.lessons
+      .filter((item) => item.status === 'active' && item.id !== ignoreId)
+      .filter((item) => item.scope === 'global' || item.projectKey === projectKey)
+      .map((item) => ({
+        lesson: item,
+        score: similarity(`${item.trigger}\n${item.lesson}`, `${args.trigger}\n${args.lesson}`),
+      }))
+      .sort((a, b) => b.score - a.score);
+  }
+
+  function saveLessonInState(ctx, state, args, extra = {}) {
+    const scope = oneOf(requiredString(args, 'scope', 20), ['global', 'project'], 'scope');
+    const projectKey = scope === 'project'
+      ? optionalString(args, 'projectKey', LIMITS.projectKey) ?? ctx.projectKey ?? null
+      : null;
+    if (scope === 'project' && !projectKey) {
+      throw new PraxisError('missing-field', '项目经验需要 projectKey', {
+        hint: '当前会话无法确定项目标识；请显式提供 projectKey，或改为 global（仅在确定适用边界时）',
+      });
+    }
+    const trigger = requiredString(args, 'trigger', LIMITS.trigger);
+    const lessonText = requiredString(args, 'lesson', LIMITS.lesson);
+    const evidence = requiredString(args, 'evidence', LIMITS.evidence);
+    const reusableBecause = requiredString(args, 'reusable_because', LIMITS.reusableBecause);
+    const strength = evidenceStrength(evidence);
+    if (strength !== 'concrete') {
+      throw new PraxisError('weak-evidence', '经验证据不足以证明结论已验证', {
+        hint: `需要同时给出具体操作/定位与可核对结果：（${evidenceGaps(evidence).join('；')}）`,
+      });
+    }
+    if (state.lessons.length >= MAX_LESSONS) {
+      throw new PraxisError('capacity', '经验数量达到上限', {
+        hint: '退役不再适用的经验后再保存；被 supersedes 链引用的经验不能删除',
+      });
+    }
+    const tags = (optionalArray(args, 'tags') ?? []).map((tag) => clip(String(tag).trim().toLowerCase(), LIMITS.tag)).filter(Boolean);
+    const observationIds = optionalArray(args, 'observationIds') ?? [];
+    if (observationIds.length > 0) {
+      for (const observationId of observationIds) {
+        const observation = state.observations.find((item) => item.id === observationId);
+        if (!observation || observation.sessionId !== ctx.sessionId) {
+          throw new PraxisError('observation-not-found', `经验引用的观察 ${observationId} 不可用`);
+        }
+      }
+    }
+    const sourceTaskId = optionalString(args, 'source_task', 80);
+    let sourceTask = null;
+    if (sourceTaskId) {
+      sourceTask = state.tasks.find((item) => item.id === sourceTaskId);
+      if (!sourceTask) throw new PraxisError('task-not-found', `来源任务 ${sourceTaskId} 不存在`);
+    }
+    const differenceReason = optionalString(args, 'difference_reason', LIMITS.reason);
+
+    const candidates = lessonCandidates(state, ctx, args);
+    const exact = candidates.find((entry) => entry.score >= 1);
+    if (exact) {
+      return {
+        lesson: summarizeLesson(exact.lesson),
+        warnings: [`已存在完全相同内容的经验 ${exact.lesson.id}，未创建第二条`],
+        duplicate: true,
+      };
+    }
+    const near = candidates.find((entry) => entry.score >= NEAR_DUPLICATE);
+    if (near && !differenceReason) {
+      throw new PraxisError('near_duplicate', '存在高度相似的经验', {
+        hint: `候选 ${near.lesson.id}（相似度 ${near.score.toFixed(2)}）；确认差异后再保存，并提供 difference_reason`,
+      });
+    }
+    const related = candidates.filter((entry) => entry.score >= RELATED).slice(0, 3);
+    const warnings = [];
+    if (related.length > 0) {
+      warnings.push(`存在相关经验：${related.map((entry) => `${entry.lesson.id}(${entry.score.toFixed(2)})`).join(', ')}`);
+    }
+
+    const supersedes = optionalString(args, 'supersedes', 80);
+    if (supersedes) {
+      const target = state.lessons.find((item) => item.id === supersedes);
+      if (!target) throw new PraxisError('lesson-not-found', `要替代的经验 ${supersedes} 不存在`);
+      if (target.status !== 'active') {
+        throw new PraxisError('conflict', `要替代的经验 ${supersedes} 状态为 ${target.status}`);
+      }
+      const compatible = target.scope === scope
+        && (scope === 'global' || target.projectKey === projectKey);
+      if (!compatible) {
+        throw new PraxisError('conflict', '被替代经验与新经验作用域不兼容', {
+          hint: '只能在相同 scope（项目经验还需相同 projectKey）之间建立替代关系',
+        });
+      }
+      if (target.supersedes === null && state.lessons.some((item) => item.supersedes === target.id)) {
+        throw new PraxisError('conflict', `经验 ${supersedes} 已被其他经验替代`);
+      }
+    }
+
+    const at = nowIso();
+    const record = {
+      id: id(),
+      scope,
+      projectKey,
+      trigger,
+      lesson: lessonText,
+      evidence,
+      evidenceStrength: strength,
+      observationIds,
+      reusable_because: reusableBecause,
+      tags,
+      source_task: sourceTaskId ?? null,
+      sourceSnapshot: extra.sourceSnapshot ?? (sourceTask ? { task_id: sourceTask.id, goal: sourceTask.goal, phase: sourceTask.phase, at } : null),
+      supersedes: supersedes ?? null,
+      supersededBy: null,
+      status: 'active',
+      retiredReason: null,
+      differenceReason,
+      revisions: [],
+      createdAt: at,
+      updatedAt: at,
+    };
+    state.lessons.push(record);
+    if (supersedes) {
+      const target = state.lessons.find((item) => item.id === supersedes);
+      target.status = 'superseded';
+      target.supersededBy = record.id;
+      target.updatedAt = at;
+      target.revisions.push({ at, reason: `被 ${record.id} 替代`, changes: { supersededBy: record.id } });
+    }
+    return { lesson: summarizeLesson(record), warnings, related: related.map((entry) => entry.lesson.id) };
+  }
+
+  function save(ctx, state, args) {
+    const result = saveLessonInState(ctx, state, args);
+    return ok(
+      {
+        lesson: result.lesson,
+        lesson_id: result.lesson.lesson_id,
+        duplicate: result.duplicate === true,
+        related: result.related ?? [],
+      },
+      result.warnings,
+    );
+  }
+
+  function update(ctx, state, args) {
+    const lessonId = requiredString(args, 'lesson_id', 80);
+    const lesson = state.lessons.find((item) => item.id === lessonId);
+    if (!lesson) throw new PraxisError('lesson-not-found', `找不到经验 ${lessonId}`);
+    if (lesson.status !== 'active') {
+      throw new PraxisError('invalid-state', `经验 ${lessonId} 状态为 ${lesson.status}，不能修订`, {
+        hint: '已被替代或退役的经验只能通过新经验表达；如需恢复，请新存一条',
+      });
+    }
+    const reason = requiredString(args, 'reason', LIMITS.reason);
+    const changes = {};
+    const next = { ...lesson };
+    if (args.trigger !== undefined) next.trigger = requiredString(args, 'trigger', LIMITS.trigger);
+    if (args.lesson !== undefined) next.lesson = requiredString(args, 'lesson', LIMITS.lesson);
+    if (args.evidence !== undefined) {
+      next.evidence = requiredString(args, 'evidence', LIMITS.evidence);
+      const strength = evidenceStrength(next.evidence);
+      if (strength !== 'concrete') {
+        throw new PraxisError('weak-evidence', '修订后的证据不足以证明结论', {
+          hint: evidenceGaps(next.evidence).join('；'),
+        });
+      }
+      next.evidenceStrength = strength;
+    }
+    if (args.reusable_because !== undefined) {
+      next.reusable_because = requiredString(args, 'reusable_because', LIMITS.reusableBecause);
+    }
+    if (args.tags !== undefined) {
+      next.tags = (optionalArray(args, 'tags') ?? [])
+        .map((tag) => clip(String(tag).trim().toLowerCase(), LIMITS.tag))
+        .filter(Boolean);
+    }
+    if (args.scope !== undefined) {
+      next.scope = oneOf(args.scope, ['global', 'project'], 'scope');
+      if (next.scope === 'global') next.projectKey = null;
+    }
+    if (args.projectKey !== undefined && next.scope === 'project') {
+      next.projectKey = optionalString(args, 'projectKey', LIMITS.projectKey);
+      if (!next.projectKey) throw new PraxisError('missing-field', '项目经验需要 projectKey');
+    }
+    for (const key of Object.keys(next)) {
+      if (key === 'revisions' || key === 'updatedAt') continue;
+      if (JSON.stringify(next[key]) !== JSON.stringify(lesson[key])) {
+        changes[key] = { from: clip(JSON.stringify(lesson[key]), 300), to: clip(JSON.stringify(next[key]), 300) };
+      }
+    }
+    if (Object.keys(changes).length === 0) {
+      return ok({ lesson_id: lesson.id, lesson: summarizeLesson(lesson) }, ['没有需要修改的字段']);
+    }
+    const conflict = lessonCandidates(state, ctx, { ...next, projectKey: next.projectKey }, lesson.id)
+      .find((entry) => entry.score >= NEAR_DUPLICATE);
+    if (conflict) {
+      throw new PraxisError('conflict', `修订后与经验 ${conflict.lesson.id} 高度相似`, {
+        hint: `相似度 ${conflict.score.toFixed(2)}；请合并、改用 supersedes，或说明差异后再试`,
+      });
+    }
+    const at = nowIso();
+    lesson.revisions.push({ at, reason, changes });
+    Object.assign(lesson, {
+      trigger: next.trigger,
+      lesson: next.lesson,
+      evidence: next.evidence,
+      evidenceStrength: next.evidenceStrength,
+      reusable_because: next.reusable_because,
+      tags: next.tags,
+      scope: next.scope,
+      projectKey: next.projectKey,
+      updatedAt: at,
+    });
+    return ok({ lesson_id: lesson.id, lesson: summarizeLesson(lesson), changed: Object.keys(changes) });
+  }
+
+  function retire(ctx, state, args) {
+    const lessonId = requiredString(args, 'lesson_id', 80);
+    const lesson = state.lessons.find((item) => item.id === lessonId);
+    if (!lesson) throw new PraxisError('lesson-not-found', `找不到经验 ${lessonId}`);
+    const reason = requiredString(args, 'reason', LIMITS.reason);
+    if (lesson.status === 'retired') {
+      return ok({ lesson_id: lesson.id, status: 'retired', lesson: summarizeLesson(lesson) }, ['经验已处于退役状态']);
+    }
+    if (lesson.status === 'superseded') {
+      throw new PraxisError('invalid-state', `经验 ${lessonId} 已被 ${lesson.supersededBy} 替代`, {
+        hint: '替代链中的经验不能再单独退役；请修订替代它的新经验',
+      });
+    }
+    const at = nowIso();
+    lesson.status = 'retired';
+    lesson.retiredReason = reason;
+    lesson.updatedAt = at;
+    lesson.revisions.push({ at, reason, changes: { status: { from: 'active', to: 'retired' } } });
+    return ok({ lesson_id: lesson.id, status: 'retired', lesson: summarizeLesson(lesson) });
+  }
+
+  // ---------- 入口 ----------
+
+  async function dispatch(ctx, tool, args) {
+    const action = args?.action;
+    if (typeof action !== 'string' || action === '') {
+      throw new PraxisError('missing-field', '缺少 action', {
+        hint: tool === 'task' ? `允许动作：${TASK_ACTIONS.join(' | ')}` : `允许动作：${LESSON_ACTIONS.join(' | ')}`,
+      });
+    }
+    if (tool === 'task') {
+      if (!TASK_ACTIONS.includes(action)) {
+        throw new PraxisError('bad-action', `未知任务动作 ${action}`, { hint: `允许动作：${TASK_ACTIONS.join(' | ')}` });
+      }
+      if (MUTATING_TASK_ACTIONS.has(action)) {
+        return write((state) => {
+          const cached = replay(state, ctx, action, args);
+          if (cached) return cached;
+          const response = { start, need, inventory, step, verify, close }[action](ctx, state, args);
+          remember(state, ctx, action, args, response);
+          return response;
+        });
+      }
+      return read((state) => status(ctx, state, args));
+    }
+    if (!LESSON_ACTIONS.includes(action)) {
+      throw new PraxisError('bad-action', `未知经验动作 ${action}`, { hint: `允许动作：${LESSON_ACTIONS.join(' | ')}` });
+    }
+    if (MUTATING_LESSON_ACTIONS.has(action)) {
+      return write((state) => {
+        const cached = replay(state, ctx, action, args);
+        if (cached) return cached;
+        const response = { save, update, retire }[action](ctx, state, args);
+        remember(state, ctx, action, args, response);
+        return response;
+      });
+    }
+    return read((state) => search(ctx, state, args));
+  }
+
+  return {
+    async task(ctx, args) {
+      try {
+        return await dispatch(ctx, 'task', args ?? {});
+      } catch (error) {
+        if (error instanceof PraxisError) return refusal(error);
+        return refusal(new PraxisError('state-corrupt', `内部错误：${error?.message ?? error}`, {
+          hint: '状态未写入；请检查输入或报告问题',
+        }));
+      }
+    },
+    async lesson(ctx, args) {
+      try {
+        return await dispatch(ctx, 'lesson', args ?? {});
+      } catch (error) {
+        if (error instanceof PraxisError) return refusal(error);
+        return refusal(new PraxisError('state-corrupt', `内部错误：${error?.message ?? error}`, {
+          hint: '状态未写入；请检查输入或报告问题',
+        }));
+      }
+    },
+    applyConfirmedWrite,
+    applyPossibleWrite,
+    // 供观察层复用的纯函数
+    observationRejection,
+  };
+}

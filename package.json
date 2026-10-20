@@ -1,0 +1,33 @@
+{
+  "name": "dsh-plugin-praxis",
+  "version": "0.2.1",
+  "description": "praxis: engineering discipline for DSH agents. Evidence-backed reuse/extend/new decisions, gated verification, and a searchable, correctable lesson book.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "Praxis-DESIGN-v0.2.1.md"
+  ],
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.1.0-rc.6"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check index.js && node --check src/evidence.js && node --check src/store.js && node --check src/engine.js && node --check src/tools.js && node --check src/observer.js && node --check src/classify.js && node --check src/lifecycle.js && node --check src/context.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  }
+}
