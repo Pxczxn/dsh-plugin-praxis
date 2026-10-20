@@ -123,9 +123,12 @@ test('改动意图的第一轮第一步会注入一次提醒', async () => {
   };
   const decision = await handler(payload, next);
   assert.equal(decision.kind, 'enter');
-  assert.equal(decision.messages.length, 1);
-  assert.equal(decision.messages[0].role, 'user');
-  assert.match(decision.messages[0].content[0].text, /praxis_task/);
+  // 提醒必须追加在原消息之后：pre-step 的 messages 是本轮完整用户消息列表，
+  // 只返回提醒会把真正的任务指令吞掉（子代理 prompt 丢失即此原因）。
+  assert.equal(decision.messages.length, 2);
+  assert.equal(decision.messages[0].content[0].text, '帮我实现一个插件');
+  assert.equal(decision.messages[1].role, 'user');
+  assert.match(decision.messages[1].content[0].text, /praxis_task/);
   assert.equal(store.state.sessions['session-1'].reminderCount, 1);
   assert.equal(store.state.sessions['session-1'].lastReminderTurn, 3);
 
@@ -237,7 +240,9 @@ test('轮次停止记录未闭环任务，下一轮第一步只提醒一次', as
   };
   const decision = await ctx.listeners.get('agent/pre-step')(payload, next);
   assert.equal(decision.kind, 'enter');
-  assert.match(decision.messages[0].content[0].text, /task-1/);
+  assert.equal(decision.messages.length, 2, '原消息与提醒都要在');
+  assert.equal(decision.messages[0].content[0].text, '继续');
+  assert.match(decision.messages[1].content[0].text, /task-1/);
   assert.equal(store.state.sessions.s1.closureHint, null);
   assert.equal(store.state.sessions.s1.closureReminderCount, 1);
 

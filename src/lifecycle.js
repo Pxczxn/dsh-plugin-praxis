@@ -163,7 +163,11 @@ export function attachLifecycle(ctx, store) {
               session.closureReminderCount = (session.closureReminderCount ?? 0) + 1;
               inject = true;
             });
-            if (inject) return { kind: 'enter', messages: [reminderMessage(closureReminder(hint))] };
+            if (inject) {
+              // 追加而不是替换：pre-step 的 messages 就是本轮完整的用户消息列表，
+              // 丢掉 payload.messages 会把真正的任务指令一起吞掉。
+              return { kind: 'enter', messages: [...(payload.messages ?? []), reminderMessage(closureReminder(hint))] };
+            }
           }
 
           if (classifyRequest(lastUserText(payload.messages)) !== 'applicable') return next();
@@ -177,7 +181,7 @@ export function attachLifecycle(ctx, store) {
             inject = true;
           });
           if (!inject) return next();
-          return { kind: 'enter', messages: [reminderMessage(REMINDER)] };
+          return { kind: 'enter', messages: [...(payload.messages ?? []), reminderMessage(REMINDER)] };
         } catch {
           return next();
         }
