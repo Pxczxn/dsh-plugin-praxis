@@ -562,3 +562,100 @@ test('同一 request_id 携带不同参数被拒绝', async () => {
   assert.equal(response.ok, false);
   assert.equal(response.code, 'idempotency-conflict');
 });
+
+// ---------- 待复核写入的解除 ----------
+
+test('覆盖全部活跃验收项的通过验证会解除待复核写入，之后可以 close(done)', async () => {
+  const { engine, state } = setup();
+  const { taskId, criterionId } = await readyToVerify(engine);
+
+  const possible = addObservation(state, taskId, {
+    kind: 'other',
+    tool: 'mcp__unknown__frobnicate',
+    callSummary: 'mcp__unknown__frobnicate({"path":"src/a.js"})',
+    changeImpact: 'possible',
+    at: '2026-01-01T00:00:00.000Z',
+  });
+  const task = state.tasks[0];
+  task.pendingChangeIds.push(possible.id);
+  task.reviewStatus = 'unverified';
+
+  const verified = addObservation(state, taskId, { at: '2026-01-01T00:05:00.000Z' });
+  const response = await engine.task(ctx, {
+    action: 'verify',
+    task_id: taskId,
+    level: 'passed',
+    scope: 'node --test',
+    coverage: [{ criterionId, result: 'passed', observationIds: [verified.id] }],
+  });
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.deepEqual(task.pendingChangeIds, [], '复验通过后待复核写入应被解除');
+  assert.equal(task.reviewStatus, 'verified');
+  assert.ok(response.warnings.some((line) => line.includes('解除')));
+
+  const done = await engine.task(ctx, {
+    action: 'close',
+    task_id: taskId,
+    outcome: 'done',
+    implementationStatus: 'complete',
+  });
+  assert.equal(done.ok, true, JSON.stringify(done));
+});
+
+test('只覆盖部分验收项的通过验证不会解除待复核写入', async () => {
+  const { engine, state } = setup();
+  const start = await engine.task(ctx, {
+    action: 'start',
+    goal: '两个验收项的任务',
+    acceptance: [{ text: '单元测试通过' }, { text: '冒烟通过' }],
+  });
+  const taskId = start.data.task_id;
+  const first = start.data.acceptance[0];
+  await concreteNeed(engine, taskId);
+  await engine.task(ctx, { action: 'step', task_id: taskId, phase: 'implement' });
+
+  const possible = addObservation(state, taskId, {
+    kind: 'other',
+    changeImpact: 'possible',
+    at: '2026-01-01T00:00:00.000Z',
+  });
+  const task = state.tasks[0];
+  task.pendingChangeIds.push(possible.id);
+
+  const verified = addObservation(state, taskId, { at: '2026-01-01T00:05:00.000Z' });
+  const verify = await engine.task(ctx, {
+    action: 'verify',
+    task_id: taskId,
+    level: 'passed',
+    scope: '只覆盖第一项',
+    coverage: [{ criterionId: first.id, result: 'passed', observationIds: [verified.id] }],
+  });
+  assert.equal(verify.ok, true, JSON.stringify(verify));
+  assert.deepEqual(task.pendingChangeIds, [possible.id], '局部验证不能洗掉待复核写入');
+
+  const done = await engine.task(ctx, {
+    action: 'close',
+    task_id: taskId,
+    outcome: 'done',
+    implementationStatus: 'complete',
+  });
+  assert.equal(done.ok, false);
+  assert.equal(done.code, 'gate');
+});
+
+test('非零退出码的观察不能作为通过证据', async () => {
+  const { engine, state } = setup();
+  const { taskId, criterionId } = await readyToVerify(engine);
+  const failing = addObservation(state, taskId, { exitCode: 1, resultSummary: '1 failing' });
+
+  const response = await engine.task(ctx, {
+    action: 'verify',
+    task_id: taskId,
+    level: 'passed',
+    scope: 'node --test',
+    coverage: [{ criterionId, result: 'passed', observationIds: [failing.id] }],
+  });
+  assert.equal(response.ok, false);
+  assert.equal(response.code, 'unverified');
+  assert.match(JSON.stringify(response), /退出码/);
+});

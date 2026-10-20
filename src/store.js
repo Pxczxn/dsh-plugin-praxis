@@ -123,13 +123,36 @@ async function atomicWrite(statePath, state) {
     }
     try {
       await fs.rename(tmpPath, statePath)
-    } catch {
-      // Some filesystems refuse rename onto an existing file; copy instead.
-      await fs.copyFile(tmpPath, statePath)
-      await fs.rm(tmpPath, { force: true })
+    } catch (renameError) {
+      // Some filesystems refuse rename onto an existing file. Remove the target
+      // and retry: if that rename also fails, the complete new state is still in
+      // the temp file, whereas copyFile straight over state.json can leave a
+      // half-written file when it fails midway.
+      let replaced = false
+      try {
+        await fs.rm(statePath, { force: true })
+        await fs.rename(tmpPath, statePath)
+        replaced = true
+      } catch {
+        replaced = false
+      }
+      if (!replaced) {
+        try {
+          await fs.copyFile(tmpPath, statePath)
+          replaced = true
+        } catch (copyError) {
+          // Keep the only complete copy of the new state for manual recovery.
+          const error = new Error(
+            `atomic replace failed (${renameError?.code ?? 'rename refused'}): ` +
+              `${copyError?.message ?? copyError}; complete state left at ${tmpPath}`,
+          )
+          error.keepTmp = true
+          throw error
+        }
+      }
     }
   } catch (error) {
-    await fs.rm(tmpPath, { force: true }).catch(() => {})
+    if (!error?.keepTmp) await fs.rm(tmpPath, { force: true }).catch(() => {})
     throw error
   }
   await fs.rm(tmpPath, { force: true }).catch(() => {})

@@ -27,6 +27,11 @@ const HOST_WRITE_ALIASES = new Set([
   'str_replace',
 ]);
 
+// The plugin's own tools write only praxis state; they never touch the
+// implementation, so they must not create pending "possible" changes that
+// would block close(done) forever.
+const LEDGER_TOOL_NAMES = new Set(['praxis_task', 'praxis_lesson']);
+
 const READ_TOOL_NAMES = new Set([
   'read',
   'read_file',
@@ -707,6 +712,7 @@ export function summarizeResult(result) {
 export function changeImpact(name, args) {
   const base = baseName(name);
   if (!base) return 'possible';
+  if (LEDGER_TOOL_NAMES.has(base)) return 'not_applicable';
   if (isWriteTool(base)) return 'confirmed';
   if (isReadTool(base)) return 'not_applicable';
   if (isShellTool(base)) {

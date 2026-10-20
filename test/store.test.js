@@ -271,13 +271,13 @@ test('a v2 document with object-shaped collections is refused', async () => {
   }
 })
 
-test('a failed atomic write leaves the previous state readable', async () => {
+test('a refused replace never leaves a half-written state behind', async () => {
   const { dir, store, statePath, cleanup } = await scratch()
   try {
     await store.mutate(state => { state.observations.push({ id: 'obs-1' }) })
     const before = await readFile(statePath, 'utf8')
 
-    // Fail the replace: a read-only target refuses rename on Windows, and the
+    // Refuse the replace: a read-only target refuses rename on Windows, and the
     // read-only directory refuses the temp/lock file on POSIX.
     await chmod(statePath, 0o444)
     await chmod(dir, 0o500)
@@ -287,20 +287,29 @@ test('a failed atomic write leaves the previous state readable', async () => {
     } catch {
       failed = true
     }
-    assert.equal(failed, true, 'the write must fail for this test to mean anything')
     await chmod(dir, 0o700)
     await chmod(statePath, 0o644)
 
-    assert.equal(await readFile(statePath, 'utf8'), before, 'the old file must be intact')
-    const reopened = createStore({ dir })
-    const state = await reopened.load()
-    assert.deepEqual(state.observations.map(observation => observation.id), ['obs-1'])
+    const after = await readFile(statePath, 'utf8')
+    if (failed) {
+      assert.equal(after, before, 'the old file must be intact')
+    } else {
+      // Removing the target and renaming the finished temp file in is a whole
+      // replacement; what must never happen is a truncated file.
+      assert.deepEqual(
+        JSON.parse(after).observations.map(observation => observation.id),
+        ['obs-1', 'obs-2'],
+      )
+    }
     assert.deepEqual(
       (await readdir(dir)).filter(name => name.includes('.tmp-')),
       [],
       'no temp file may be left behind',
     )
-    assert.equal(store.read().observations.length, 1, 'the cache must not expose an unwritten state')
+    const reopened = createStore({ dir })
+    const state = await reopened.load()
+    assert.deepEqual(state.observations.map(o => o.id), failed ? ['obs-1'] : ['obs-1', 'obs-2'])
+    assert.equal(store.read().observations.length, state.observations.length, 'cache matches disk')
   } finally {
     await cleanup()
   }

@@ -277,6 +277,11 @@ function observationRejection(observation) {
     return `工具类型 ${observation.kind} 只能作过程证据，不能作为验收证明`;
   }
   if (!observation.resultSummary) return '缺少可复核的结果摘要';
+  // isError:false 只说明宿主没抛错；非零退出码仍可能来自被管道吞掉失败的
+  // 命令，不能算一次通过的检查。
+  if (Number.isFinite(observation.exitCode) && observation.exitCode !== 0) {
+    return `退出码 ${observation.exitCode}，非零退出码不能作为通过证据`;
+  }
   return null;
 }
 
@@ -769,10 +774,49 @@ export function createEngine(store) {
       pushEvent(task, 'advance', '验证成功后进入 verify', at);
     }
     pushEvent(task, 'verify', `${level}（${provenance}）`, at);
+
+    // 解除路径（design §3.3.3）：通过验证会重新确立实现的可信度，因此发生在
+    // 这次验证之前的 possible 写入视为已被覆盖。只在整个任务全部活跃验收项
+    // 都被本次验证覆盖时才解除，避免用局部验证洗掉可疑写入。
+    if (level === 'passed' && task.pendingChangeIds.length > 0) {
+      const activeItems = task.acceptance.filter((item) => item.active);
+      const fullyCovered =
+        activeItems.length > 0 &&
+        activeItems.every((item) =>
+          perRow.some(
+            (row) => row.criterionId === item.id && row.result === 'passed' && row.observationIds.length > 0,
+          ),
+        );
+      const verificationTime = Math.min(
+        ...allObservations
+          .map((item) => Date.parse(String(item.at ?? '')))
+          .filter((value) => Number.isFinite(value)),
+      );
+      if (fullyCovered && Number.isFinite(verificationTime)) {
+        const cleared = [];
+        task.pendingChangeIds = task.pendingChangeIds.filter((changeId) => {
+          const change = state.observations.find((item) => item?.id === changeId);
+          const changeTime = change ? Date.parse(String(change.at ?? '')) : Number.NaN;
+          if (Number.isFinite(changeTime) && changeTime < verificationTime) {
+            cleared.push(changeId);
+            return false;
+          }
+          return true;
+        });
+        if (cleared.length > 0) {
+          if (task.pendingChangeIds.length === 0) task.reviewStatus = 'verified';
+          pushEvent(task, 'verify', `复验解除可能的写入：${cleared.join(', ')}`, at);
+          warnings.push(`已由本次复验解除待复核写入：${cleared.join(', ')}`);
+        }
+      }
+    }
+
     touch(task, at);
 
     const nextHint = level === 'passed'
-      ? '确认未覆盖验收项与待复核写入后，可尝试 close(done)'
+      ? task.pendingChangeIds.length > 0
+        ? `仍有 ${task.pendingChangeIds.length} 条待复核写入（${task.pendingChangeIds.join(', ')}）；再跑一次覆盖全部活跃验收项的通过验证即可解除`
+        : '确认未覆盖验收项与待复核写入后，可尝试 close(done)'
       : '记录问题并考虑 step 回退修复；不要用 remove 验收项绕过门槛';
     return ok(
       {

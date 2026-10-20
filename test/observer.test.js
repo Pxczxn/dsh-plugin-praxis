@@ -508,6 +508,9 @@ test('changeImpact grades shell commands conservatively', () => {
   assert.equal(changeImpact('bash', { command: 'echo "npm test" > /dev/null' }), 'irrelevant');
   assert.equal(changeImpact('bash', { command: 'mystery-tool --flag' }), 'possible');
   assert.equal(changeImpact('some_mcp_tool', {}), 'possible');
+  // praxis 自己的台账工具只写 state.json，不应制造阻断 done 的待复核写入。
+  assert.equal(changeImpact('praxis_task', {}), 'not_applicable');
+  assert.equal(changeImpact('praxis_lesson', {}), 'not_applicable');
 });
 
 test('classifyTool assigns the observation kind', () => {

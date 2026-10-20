@@ -13,6 +13,9 @@ function makeStore() {
   const state = emptyState();
   return {
     state,
+    async load() {
+      return state;
+    },
     async mutate(fn) {
       const result = await fn(state);
       return result ?? state;
@@ -174,6 +177,68 @@ test('存储写失败时 pre-step 仍放行，不阻断对话', async () => {
   const handler = ctx.listeners.get('agent/pre-step');
   const decision = await handler(
     { agent: { id: 's1' }, turn: 1, step: 1, messages: [userMessage('实现插件')] },
+    next,
+  );
+  assert.equal(decision.kind, 'allow');
+});
+
+test('轮次停止记录未闭环任务，下一轮第一步只提醒一次', async () => {
+  const ctx = makeContext();
+  const store = makeStore();
+  store.state.tasks.push({
+    id: 'task-1',
+    goal: '实现插件',
+    sessionId: 's1',
+    phase: 'implement',
+    status: 'open',
+    acceptance: [{ id: 'criterion-1', active: true }],
+    verificationHistory: [],
+    pendingChangeIds: ['obs-1'],
+  });
+  attachLifecycle(ctx, store);
+
+  await ctx.listeners.get('agent/turn-stopping')({ agent: { id: 's1' }, turn: 2 });
+  const hint = store.state.sessions.s1.closureHint;
+  assert.equal(hint.taskId, 'task-1');
+  assert.equal(hint.pending, true);
+  assert.ok(hint.detail.some((line) => /implement/.test(line)));
+
+  const payload = {
+    agent: { id: 's1' },
+    turn: 3,
+    step: 1,
+    messages: [userMessage('继续')],
+  };
+  const decision = await ctx.listeners.get('agent/pre-step')(payload, next);
+  assert.equal(decision.kind, 'enter');
+  assert.match(decision.messages[0].content[0].text, /task-1/);
+  assert.equal(store.state.sessions.s1.closureHint, null);
+  assert.equal(store.state.sessions.s1.closureReminderCount, 1);
+
+  const again = await ctx.listeners.get('agent/pre-step')(payload, next);
+  assert.equal(again.kind, 'allow', '提醒过一次之后不再重复');
+});
+
+test('已闭环的任务不会触发未闭环提醒', async () => {
+  const ctx = makeContext();
+  const store = makeStore();
+  store.state.tasks.push({
+    id: 'task-2',
+    goal: '实现插件',
+    sessionId: 's1',
+    phase: 'verify',
+    status: 'open',
+    acceptance: [{ id: 'criterion-1', active: true }],
+    verificationHistory: [{ level: 'passed', valid: true }],
+    pendingChangeIds: [],
+  });
+  attachLifecycle(ctx, store);
+
+  await ctx.listeners.get('agent/turn-stopping')({ agent: { id: 's1' }, turn: 2 });
+  assert.equal(store.state.sessions.s1.closureHint.pending, false);
+
+  const decision = await ctx.listeners.get('agent/pre-step')(
+    { agent: { id: 's1' }, turn: 3, step: 1, messages: [userMessage('继续')] },
     next,
   );
   assert.equal(decision.kind, 'allow');

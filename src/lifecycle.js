@@ -90,6 +90,35 @@ function sessionOf(state, sessionId) {
   return created;
 }
 
+/** 本会话里第一个仍 open 的任务；多于一个时只诊断第一个，不替模型选。 */
+function openTaskOf(state, sessionId) {
+  return state.tasks.find((task) => task && task.status === 'open' && task.sessionId === sessionId) ?? null;
+}
+
+/** 只做粗略诊断：具体门槛由 praxis_task close 判定，这里用于决定是否提醒。 */
+function closureGaps(task) {
+  const gaps = [];
+  if (task.phase !== 'verify') gaps.push(`仍在 ${task.phase} 阶段`);
+  const active = (task.acceptance ?? []).filter((item) => item.active);
+  if (active.length === 0) gaps.push('没有活跃验收项');
+  const passed = (task.verificationHistory ?? []).some(
+    (item) => item && item.level === 'passed' && item.valid !== false,
+  );
+  if (!passed) gaps.push('没有有效的通过验证');
+  if ((task.pendingChangeIds ?? []).length > 0) {
+    gaps.push(`有 ${task.pendingChangeIds.length} 条待复核写入`);
+  }
+  return gaps;
+}
+
+function closureReminder(hint) {
+  return [
+    `[Praxis] 上一轮结束时任务 ${hint.taskId} 仍未闭环：${hint.detail.join('；')}。`,
+    '如果这一轮确实完成了工作，用 praxis_task verify 引用观察 ID 后 close；',
+    '如果还没完成，用 step 推进阶段或用 need 记录下一步，不要只在回复里口头收尾。',
+  ].join('');
+}
+
 /** 接线失败时返回的 dispose 上带 degraded 字段，调用方据此报告降级而不是假装启用。 */
 export function attachLifecycle(ctx, store) {
   const disposers = [];
@@ -126,6 +155,22 @@ export function attachLifecycle(ctx, store) {
           if (!sessionId || typeof turn !== 'number') return next();
           // 只在本轮第一个模型步骤提醒；后续 step 继续走原流程。
           if (typeof payload.step === 'number' && payload.step > 1) return next();
+
+          // 闭环提醒优先：上一轮结束时任务还开着，就具体点出缺什么。
+          const snapshot = await store.load();
+          const hint = snapshot.sessions?.[sessionId]?.closureHint;
+          if (hint && hint.pending && hint.taskId) {
+            let inject = false;
+            await store.mutate((state) => {
+              const session = sessionOf(state, sessionId);
+              if (!session.closureHint || session.closureHint.taskId !== hint.taskId) return;
+              session.closureHint = null;
+              session.closureReminderCount = (session.closureReminderCount ?? 0) + 1;
+              inject = true;
+            });
+            if (inject) return { kind: 'enter', messages: [reminderMessage(closureReminder(hint))] };
+          }
+
           if (classifyRequest(lastUserText(payload.messages)) !== 'applicable') return next();
 
           let inject = false;
@@ -152,6 +197,19 @@ export function attachLifecycle(ctx, store) {
             const session = sessionOf(state, sessionId);
             session.turnStops = (session.turnStops ?? 0) + 1;
             session.lastTurnStopAt = new Date().toISOString();
+            // 只诊断、不结项：把“还差什么”留给下一轮开头提醒一次。
+            const task = openTaskOf(state, sessionId);
+            if (!task) {
+              session.closureHint = null;
+              return;
+            }
+            const detail = closureGaps(task);
+            session.closureHint = {
+              taskId: task.id,
+              pending: detail.length > 0,
+              detail: detail.length > 0 ? detail : [],
+              phase: task.phase,
+            };
           });
         } catch {
           // 诊断信息写不进去不影响整轮结束
