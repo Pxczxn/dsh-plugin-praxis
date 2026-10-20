@@ -1,5 +1,6 @@
 // 生命周期钩子：静态指引段落、每轮一次提醒、轮次停止诊断。只做提醒，不改写任务状态。
 import { clip } from './evidence.js';
+import { resolveService } from './context.js';
 
 export const GUIDANCE = [
   'Praxis 是宿主内的任务与经验台账（工具 praxis_task 与 praxis_lesson）。',
@@ -124,13 +125,7 @@ export function attachLifecycle(ctx, store) {
   const disposers = [];
   const degraded = [];
 
-  const systemPrompt = (() => {
-    try {
-      return ctx?.systemPrompt ?? ctx?.get?.('systemPrompt') ?? null;
-    } catch {
-      return null;
-    }
-  })();
+  const systemPrompt = resolveService(ctx, 'systemPrompt');
 
   if (systemPrompt && typeof systemPrompt.section === 'function') {
     try {

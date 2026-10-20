@@ -14,6 +14,7 @@ export const TASK_DESCRIPTION = `记录一个开发任务的调查判断、阶�
 - verify(task_id, level, scope, coverage[], evidence?, note?)：把验证结果映射到验收项；passed 的每一项必须引用宿主观察 ID（先用 status 查看候选）
 - close(task_id, outcome, implementationStatus, closureReason?, note?, lesson?, lesson_id?)：done 需要当前 revision 对全部活跃验收项有可信通过记录；等待人工验收用 partial + complete + awaiting_manual
 - status(task_id?)：概览或详情；详情含候选观察、未覆盖验收项、待复核写入
+- summary()：跨任务只读概览——阶段/结局/项目计数、未结任务及其收尾阻碍、经验与观察统计；不改变任何状态
 
 响应含 ok/code/data/warnings。所有变更动作可用 request_id 获得一次性幂等重试。插件只记录与提醒，不能证明业务正确性。`;
 
@@ -86,7 +87,7 @@ export const TASK_PARAMETERS = {
   properties: {
     action: {
       type: 'string',
-      enum: ['start', 'need', 'inventory', 'step', 'verify', 'close', 'status'],
+      enum: ['start', 'need', 'inventory', 'step', 'verify', 'close', 'status', 'summary'],
     },
     task_id: { type: 'string' },
     goal: { type: 'string' },

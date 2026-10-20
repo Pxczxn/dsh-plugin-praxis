@@ -12,7 +12,7 @@ import {
 } from './src/tools.js';
 import { attachObserver } from './src/observer.js';
 import { attachLifecycle } from './src/lifecycle.js';
-import { contextOf } from './src/context.js';
+import { contextOf, resolveService } from './src/context.js';
 
 export const name = 'dsh-plugin-praxis';
 export const inject = ['tools'];
@@ -25,7 +25,7 @@ const output = {
 };
 
 function warn(ctx, message) {
-  const logger = ctx?.logger;
+  const logger = resolveService(ctx, 'logger');
   if (logger && typeof logger.warn === 'function') logger.warn(message);
   else console.warn(`[praxis] ${message}`);
 }

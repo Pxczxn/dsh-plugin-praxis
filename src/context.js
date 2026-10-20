@@ -4,13 +4,30 @@ import { execFileSync } from 'node:child_process';
 const PROJECT_CACHE_MS = 60_000;
 const projectCache = new Map();
 
-function resolveSessions(ctx) {
-  if (ctx?.sessions) return ctx.sessions;
+/**
+ * 解析一个可选宿主服务。
+ *
+ * Cordis 只允许访问 inject 里声明过的服务：插件只 inject 了 tools，直接读
+ * `ctx.sessions` / `ctx.systemPrompt` 会抛 "cannot get property ... without inject"。
+ * 属性访问必须自己兜异常，再退回 ctx.get（对未声明服务返回 undefined 而不抛）。
+ * 拿不到就当没有，调用方降级，不要因此让插件装配失败。
+ */
+export function resolveService(ctx, name) {
   try {
-    return ctx?.get?.('sessions') ?? null;
+    const direct = ctx?.[name];
+    if (direct) return direct;
+  } catch {
+    // 未在 inject 声明，宿主拒绝属性访问；继续走 ctx.get
+  }
+  try {
+    return ctx?.get?.(name) ?? null;
   } catch {
     return null;
   }
+}
+
+function resolveSessions(ctx) {
+  return resolveService(ctx, 'sessions');
 }
 
 function resolveCwd(ctx, sessionId) {

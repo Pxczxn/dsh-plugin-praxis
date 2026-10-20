@@ -43,6 +43,9 @@ Praxis 给 DSH 加上一套**任务台账**与**可检索的错题本**：它不
 | `verify` | 记录一次验证：`level`、`scope`、逐项 `coverage[]` 与观察 ID |
 | `close` | 结项：`outcome`（`done`/`partial`/`abandoned`）+ `implementationStatus` |
 | `status` | 查看任务现状、未覆盖验收项、候选观察与阻断原因 |
+| `summary` | 跨任务只读概览：阶段/结局/项目计数、未结任务及其收尾阻碍、经验与观察统计 |
+
+`status` 与 `summary` 的分工：前者一次只看一个任务（含候选观察分页），后者回答「整体到哪了」。`summary` 是纯读动作——不改状态、不产生观察、不需要 `request_id`；`byPhase`/`byImplementationStatus` 统计全部任务（含已关闭任务，它们停在关闭时的阶段），未结任务只展开最近活跃的 20 条，其余用 `openRemaining` 计数。
 
 关键门槛：
 

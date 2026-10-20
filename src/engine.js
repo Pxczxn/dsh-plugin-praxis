@@ -24,7 +24,16 @@ export const CLOSURE_REASONS = [
   'other',
 ];
 export const DECISIONS = ['reuse', 'extend', 'new'];
-export const TASK_ACTIONS = ['start', 'need', 'inventory', 'step', 'verify', 'close', 'status'];
+export const TASK_ACTIONS = [
+  'start',
+  'need',
+  'inventory',
+  'step',
+  'verify',
+  'close',
+  'status',
+  'summary',
+];
 export const LESSON_ACTIONS = ['search', 'save', 'update', 'retire'];
 
 export const NEAR_DUPLICATE = 0.85;
@@ -35,6 +44,8 @@ export const MAX_EVENTS = 40;
 export const MAX_OBSERVATIONS = 1000;
 export const MAX_REQUESTS = 500;
 export const REPEAT_REWIND_AT = 3;
+// summary 是只读概览：计数铺开，细节只展开最近活跃的前 N 个未结任务。
+export const MAX_SUMMARY_TASKS = 20;
 
 const MUTATING_TASK_ACTIONS = new Set(['start', 'need', 'inventory', 'step', 'verify', 'close']);
 const MUTATING_LESSON_ACTIONS = new Set(['save', 'update', 'retire']);
@@ -1025,6 +1036,136 @@ export function createEngine(store) {
     });
   }
 
+  // 跨任务只读概览。与 status 的分工：status 面向单个任务（详情、候选观察），
+  // summary 面向「整体到哪了」——只聚合、不改状态、不产生观察。
+  function summary(ctx, state, args) {
+    const warnings = [];
+    if (args?.task_id) {
+      warnings.push('summary 只做跨任务聚合，task_id 已忽略；查看单个任务请用 status');
+    }
+    const degraded = [];
+    if (state.droppedObservations > 0) degraded.push(`已丢弃 ${state.droppedObservations} 条超出容量的观察`);
+    if (state.observerErrors > 0) degraded.push(`观察采集失败 ${state.observerErrors} 次`);
+
+    const byPhase = Object.fromEntries(PHASES.map((phase) => [phase, 0]));
+    const byImplementationStatus = Object.fromEntries(
+      IMPLEMENTATION_STATUS.map((status) => [status, 0]),
+    );
+    const byOutcome = { open: 0 };
+    for (const outcome of OUTCOMES) byOutcome[outcome] = 0;
+    const projects = new Map();
+    const openTasks = [];
+
+    for (const task of state.tasks) {
+      if (task.phase in byPhase) byPhase[task.phase] += 1;
+      if (task.implementationStatus in byImplementationStatus) {
+        byImplementationStatus[task.implementationStatus] += 1;
+      }
+      if (task.status === 'open') {
+        byOutcome.open += 1;
+        openTasks.push(task);
+      } else if (task.closedAs in byOutcome) {
+        byOutcome[task.closedAs] += 1;
+      }
+      const key = task.projectKey ?? null;
+      const bucket = projects.get(key) ?? { projectKey: key, total: 0, open: 0, closed: 0 };
+      bucket.total += 1;
+      if (task.status === 'open') bucket.open += 1;
+      else bucket.closed += 1;
+      projects.set(key, bucket);
+    }
+
+    // 待复核写入最能打断收尾，先让它排前面；同档按最近更新时间。
+    const recent = [...openTasks]
+      .sort((a, b) => {
+        const delta = b.pendingChangeIds.length - a.pendingChangeIds.length;
+        if (delta !== 0) return delta;
+        return String(b.updatedAt).localeCompare(String(a.updatedAt));
+      })
+      .slice(0, MAX_SUMMARY_TASKS);
+
+    const open = recent.map((task) => {
+      const { blockers, uncovered } = readiness(task);
+      const active = task.acceptance.filter((item) => item.active);
+      return {
+        task_id: task.id,
+        goal: task.goal,
+        projectKey: task.projectKey,
+        phase: task.phase,
+        revision: task.revision,
+        implementationStatus: task.implementationStatus,
+        reviewStatus: task.reviewStatus,
+        acceptance: {
+          active: active.length,
+          manual: active.filter((item) => item.kind === 'manual').length,
+          covered: verifiedAcceptanceIds(task).size,
+        },
+        pendingChanges: task.pendingChangeIds.length,
+        uncovered,
+        blockers,
+        updatedAt: task.updatedAt,
+      };
+    });
+
+    const activeLessons = state.lessons.filter((item) => item.status === 'active');
+    const tagCounts = new Map();
+    for (const lesson of activeLessons) {
+      for (const tag of lesson.tags) tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
+    }
+    const tags = [...tagCounts.entries()]
+      .map(([tag, count]) => ({ tag, count }))
+      .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag))
+      .slice(0, 10);
+
+    const observationOutcomes = new Map();
+    let bound = 0;
+    let rejected = 0;
+    for (const observation of state.observations) {
+      observationOutcomes.set(
+        observation.outcome,
+        (observationOutcomes.get(observation.outcome) ?? 0) + 1,
+      );
+      if (observation.taskId != null) bound += 1;
+      if (observationRejection(observation) !== null) rejected += 1;
+    }
+
+    return ok({
+      tasks: {
+        total: state.tasks.length,
+        open: openTasks.length,
+        closed: state.tasks.length - openTasks.length,
+        byPhase,
+        byOutcome,
+        byImplementationStatus,
+        byProject: [...projects.values()].sort((a, b) => b.total - a.total),
+      },
+      open,
+      openTruncated: openTasks.length > open.length,
+      openRemaining: Math.max(openTasks.length - open.length, 0),
+      lessons: {
+        total: state.lessons.length,
+        active: activeLessons.length,
+        global: activeLessons.filter((item) => item.scope === 'global').length,
+        project: activeLessons.filter((item) => item.scope === 'project').length,
+        tags,
+      },
+      observations: {
+        total: state.observations.length,
+        bound,
+        unbound: state.observations.length - bound,
+        rejected,
+        usable: state.observations.length - rejected,
+        byOutcome: [...observationOutcomes.entries()].map(([outcome, count]) => ({
+          outcome,
+          count,
+        })),
+        dropped: state.droppedObservations ?? 0,
+        errors: state.observerErrors ?? 0,
+      },
+      degraded,
+    }, warnings);
+  }
+
   // ---------- 经验动作 ----------
 
   function visibleLesson(ctx, state, args, lesson) {
@@ -1324,7 +1465,8 @@ export function createEngine(store) {
           return response;
         });
       }
-      return read((state) => status(ctx, state, args));
+      const reader = action === 'summary' ? summary : status;
+      return read((state) => reader(ctx, state, args));
     }
     if (!LESSON_ACTIONS.includes(action)) {
       throw new PraxisError('bad-action', `未知经验动作 ${action}`, { hint: `允许动作：${LESSON_ACTIONS.join(' | ')}` });

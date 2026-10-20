@@ -140,10 +140,13 @@ export function createEngine(store)
 
 动作、参数与状态转换严格按设计稿 §4/§4.1/§4.2/§4.3/§5。`engine.task` 内部通过 `store.mutate` 实现单事务；返回统一响应。
 
+v0.2.3 增补：只读动作 `summary` 提供跨任务聚合（`tasks.byPhase`/`byOutcome`/`byImplementationStatus`/`byProject`、未结任务前 `MAX_SUMMARY_TASKS`=20 条及其 `blockers`、`lessons` 标签热度、`observations` 可用性统计）。它走 `store.load` 只读路径，不进 `store.mutate`、不写 `requests`、不产生观察；`byPhase`/`byImplementationStatus` 统计全部任务（含已关闭任务，停在关闭时的阶段）。
+
 ## 9. `src/tools.js` / `index.js`（Lead 负责）
 
 - `praxis_task` / `praxis_lesson` 两个工具，schema 按设计稿 §4/§5，`output.schema` 为 `{ type: 'object', ... }`，`render()` 返回 `[{ type: 'text', text }]`。
 - `index.js`：`export const name = 'dsh-plugin-praxis'`，`inject = ['tools', 'sessions', 'systemPrompt']` 中不存在的可选依赖用 `ctx.get(...)` 兜底。
+- 兜底前提：Cordis 对未在 `inject` 声明的服务**属性访问本身就会抛错**（如 `ctx.sessions` → `cannot get property "sessions" without inject`）。`src/context.js` 的 `resolveSessions` 必须先把属性访问包在 `try` 里，失败再退回 `ctx.get(...)`；`src/lifecycle.js` 的 systemPrompt 解析同理。回归用例见 `test/context.test.js`。
 
 ## 10. 测试
 

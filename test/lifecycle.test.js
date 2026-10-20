@@ -63,6 +63,32 @@ test('挂载时注册 order 9500 的静态段落', () => {
   dispose();
 });
 
+test('宿主未 inject systemPrompt 时经 ctx.get 仍能注册段落，而不是静默降级', () => {
+  const sections = [];
+  const service = {
+    section(section) {
+      sections.push(section);
+      return () => {};
+    },
+  };
+  const ctx = {
+    get(name) {
+      return name === 'systemPrompt' ? service : undefined;
+    },
+    get systemPrompt() {
+      throw new Error('cannot get property "systemPrompt" without inject');
+    },
+    on() {
+      return () => {};
+    },
+  };
+  const dispose = attachLifecycle(ctx, makeStore());
+  assert.equal(sections.length, 1);
+  assert.equal(sections[0].order, 9500);
+  assert.equal(dispose.degraded, null);
+  dispose();
+});
+
 test('没有 systemPrompt 与事件总线时报告降级', () => {
   const dispose = attachLifecycle({}, makeStore());
   assert.equal(typeof dispose, 'function');
