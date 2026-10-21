@@ -80,7 +80,7 @@ Praxis 给 DSH 加上一套**任务台账**与**可检索的错题本**：它不
 
 ## 自动观察
 
-插件监听 `tools/pre-execute` 与 `tools/result`，把工具调用与结果记录为观察（脱敏并截断），供 `verify` 与经验引用：
+插件监听 `tools/result`，把工具调用与结果记录为观察（脱敏并截断），供 `verify` 与经验引用：
 
 - 确认写入（`write`/`edit`/`patch` 等）会让任务 `revision` 递增，并让先前的验证失效；
 - 每条观察都记下采集时的**实现版本**。实现变更后，变更前采集的观察不能再作为通过证据（`verify` 报 `stale-verification`），必须重跑检查；

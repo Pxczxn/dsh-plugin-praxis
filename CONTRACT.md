@@ -1,5 +1,7 @@
 # Praxis v0.2.1 实现契约（内部，供并行开发对齐）
 
+> 当前实现版本 1.0.0。本文保留 v0.2.1 基线，并已并入 v0.2.3（summary）与 v1.0（提示通道、implRevision、dataDir）的行为。
+
 依据 `Praxis-DESIGN-v0.2.1.md`。纯 ESM JS（Node >= 20，无第三方依赖）。所有模块只 import `./evidence.js`、`./classify.js` 或 node 内置。
 
 ## 0. 通用约定
@@ -125,7 +127,8 @@ export function classifyRequest(text)       // 'applicable' | 'not_applicable' |
 ```
 
 - `ctx.systemPrompt.section({ name: 'praxis', order: 9500, text: GUIDANCE })`；`ctx.systemPrompt` 不存在时返回 `{ degraded: 'hook-unavailable' }` 且不抛。
-- `ctx.on('agent/pre-step', async (payload, next) => {...})`：只对 `classifyRequest(...) === 'applicable'` 的**用户轮次**注入一次紧凑提醒；去重键 `sessionId + turn`，存 `state.sessions[sessionId]`；注入返回 `{ kind: 'enter', messages: [...] }`，提醒文本使用 `REMINDER` 常量；注入失败/不适用 → 调 `next()`。**不要每个 step 注入。**
+- `ctx.on('agent/pre-step', async (payload, next) => {...})`：只在每轮第一步计算，只对 `classifyRequest(...) === 'applicable'` 的**用户轮次**写提示；去重键 `sessionId + turn`，文本写进 `state.sessions[sessionId].praxisHint`，**不改写消息列表**（返回 `{ kind: 'enter', messages }` 会把插件的话渲染成用户气泡，已废弃）；每轮结束都调 `next()`。
+- `ctx.systemPrompt.context({ name: 'praxis:hint', order: 150, text })`：请求前按 `context.agent.session` 同步求值，读 `store.read()` 里的 `praxisHint`；`systemPrompt.context` 不存在时记 `prompt-context` 降级。
 - `ctx.on('agent/turn-stopping', async (payload) => {...})`：`observe` 模式，只记录诊断，不发消息、不续步。
 - 任一钩子接线抛错 → 返回 degraded 标识，不吞错假装启用。
 
@@ -145,7 +148,7 @@ v0.2.3 增补：只读动作 `summary` 提供跨任务聚合（`tasks.byPhase`/`
 ## 9. `src/tools.js` / `index.js`（Lead 负责）
 
 - `praxis_task` / `praxis_lesson` 两个工具，schema 按设计稿 §4/§5，`output.schema` 为 `{ type: 'object', ... }`，`render()` 返回 `[{ type: 'text', text }]`。
-- `index.js`：`export const name = 'dsh-plugin-praxis'`，`inject = ['tools', 'sessions', 'systemPrompt']` 中不存在的可选依赖用 `ctx.get(...)` 兜底。
+- `index.js`：`export const name = 'dsh-plugin-praxis'`，`inject = ['tools']`；`sessions`、`systemPrompt`、`logger` 等可选服务不进 inject，统一由 `resolveService`（先 try 属性、失败再 `ctx.get`）兜底。
 - 兜底前提：Cordis 对未在 `inject` 声明的服务**属性访问本身就会抛错**（如 `ctx.sessions` → `cannot get property "sessions" without inject`）。`src/context.js` 的 `resolveSessions` 必须先把属性访问包在 `try` 里，失败再退回 `ctx.get(...)`；`src/lifecycle.js` 的 systemPrompt 解析同理。回归用例见 `test/context.test.js`。
 
 ## 10. 测试
@@ -153,9 +156,9 @@ v0.2.3 增补：只读动作 `summary` 提供跨任务聚合（`tasks.byPhase`/`
 - `test/store.test.js`（队友 A）：锁竞争、损坏拒写、版本拒绝、原子写失败不破坏原文件、并发 mutate。
 - `test/observer.test.js`（队友 B）：缺身份不记录、去重、唯一活动任务归属、confirmed 使验证失效、possible 进 pending、容量不删被引用。
 - `test/lifecycle.test.js`（队友 C）：适用性分类、pre-step 每轮只注入一次、section 注册、钩子缺失降级。
-- `test/engine.test.js`、`test/lesson.test.js`、`test/tools.test.js`（Lead）：A/B/D/E 组契约。
+- `test/engine.test.js`、`test/lesson.test.js`、`test/plugin.test.js`（Lead）：A/B/D/E 组契约与工具 schema 装配。
 
 ## 11. 硬性禁止
 
-- 不新增第三方依赖；不读用户仓库文件（除 `git rev-parse`）；不启动子代理/浏览器/测试命令。
+- 不新增第三方依赖；除 `git rev-parse` 与判定 `npm run <script>` 所需的 `package.json` 外不读用户仓库文件；不启动子代理/浏览器/测试命令。
 - 不修改本目录之外的文件；测试用临时目录覆写 `DSH_PRAXIS_DATA_DIR`。
