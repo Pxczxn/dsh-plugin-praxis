@@ -11,6 +11,7 @@ async function mount() {
 
   const registered = [];
   const sections = [];
+  const contexts = [];
   const listeners = [];
   const ctx = {
     tools: {
@@ -28,6 +29,10 @@ async function mount() {
         sections.push(section);
         return () => {};
       },
+      context(provider) {
+        contexts.push(provider);
+        return () => {};
+      },
     },
     on(event, handler) {
       listeners.push({ event, handler });
@@ -42,6 +47,7 @@ async function mount() {
     plugin,
     registered,
     sections,
+    contexts,
     listeners,
     exec,
     dispose,
@@ -72,13 +78,21 @@ test('apply 注册两个工具并符合宿主工具契约', async () => {
 });
 
 test('apply 挂载观察者、生命周期提示段与回合提醒', async () => {
-  const { sections, listeners, cleanup } = await mount();
+  const { sections, contexts, listeners, cleanup } = await mount();
   try {
     assert.equal(sections.length, 1);
     assert.equal(sections[0].name, 'praxis');
     assert.equal(sections[0].order, 9500);
     assert.equal(typeof sections[0].text, 'string');
     assert.match(sections[0].text, /praxis/);
+
+    // 动态提示走宿主的运行时上下文通道：不占消息位，按会话求值。
+    assert.equal(contexts.length, 1);
+    assert.equal(contexts[0].name, 'praxis:hint');
+    assert.equal(contexts[0].order, 150);
+    assert.equal(contexts[0].interpolate, false);
+    assert.equal(contexts[0].text({ agent: { session: 'session-1' } }), '');
+    assert.equal(contexts[0].text({ agent: undefined }), '');
 
     const events = listeners.map((item) => item.event);
     // 观察者只需要工具结果事件；pre-execute 不是必需通道。

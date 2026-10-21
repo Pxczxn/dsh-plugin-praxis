@@ -344,6 +344,9 @@ const TEST_PATTERNS = [
 ];
 
 const LINT_PATTERNS = [
+  // node --check 只解析语法、不执行代码，作用等同 lint；不认它会让 `npm run check`
+  // 展开脚本后整条落到 unknown，把纯检查误记成待复核写入。
+  /^node\s+--check\b/,
   /^(?:npx\s+)?eslint\b/,
   /^(?:tslint|stylelint|jshint|biome)\b/,
   /^prettier\s+(?:--check|-c|--list-different)\b/,

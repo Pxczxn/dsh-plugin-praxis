@@ -610,6 +610,7 @@ test('npm run 只在脚本体可确认时放宽，自定义脚本仍然算可能
         name: 'demo',
         scripts: {
           check: 'node --test',
+          syntax: 'node --check index.js',
           lint: 'eslint .',
           bench: 'node bench/bench.js',
           deploy: 'node deploy.js && rm -rf dist',
@@ -621,6 +622,11 @@ test('npm run 只在脚本体可确认时放宽，自定义脚本仍然算可能
     assert.equal(classifyTool('bash', { command: 'npm run check' }, { cwd: dir }), 'test');
     assert.equal(changeImpact('bash', { command: 'npm run check' }, { cwd: dir }), 'irrelevant');
     assert.equal(changeImpact('bash', { command: 'npm run lint' }, { cwd: dir }), 'irrelevant');
+    // node --check 只解析语法、不执行代码：它必须和 eslint 一样算检查，否则 `npm run check`
+    // 展开脚本后会整条落到 unknown，把纯静态检查误记成待复核写入。
+    assert.equal(classifyTool('bash', { command: 'npm run syntax' }, { cwd: dir }), 'lint');
+    assert.equal(changeImpact('bash', { command: 'npm run syntax' }, { cwd: dir }), 'irrelevant');
+    assert.equal(changeImpact('bash', { command: 'node --check index.js' }, { cwd: dir }), 'irrelevant');
 
     // bench 跑的是项目自己写的 JS，可能写文件，不能一律当只读。
     assert.equal(classifyTool('bash', { command: 'npm run bench' }, { cwd: dir }), 'other');
