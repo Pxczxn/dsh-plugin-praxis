@@ -654,9 +654,17 @@ function commandImpact(segment, options = {}) {
     const body = scriptBodyOf(normalized, options);
     if (body !== null) {
       const impacts = shellImpact(body, { ...options, depth: depth + 1 });
-      if (impacts.every((impact) => impact === 'read-only' || impact === 'test' || impact === 'lint')) {
+      if (
+        impacts.every(
+          (impact) =>
+            impact === 'read-only' || impact === 'test' || impact === 'lint' || impact === 'build',
+        )
+      ) {
         if (impacts.includes('test')) return 'test';
         if (impacts.includes('lint')) return 'lint';
+        // 构建脚本展开后是 build（tsc -p . / vite build / next build）。脚本名可解析
+        // 时反而降级成 unknown，会让 `npm run build` 永远拿不到 build 身份。
+        if (impacts.includes('build')) return 'build';
         return 'read-only';
       }
       return 'unknown';
@@ -892,10 +900,14 @@ export function changeImpact(name, args, options = {}) {
     if (!command.trim()) return 'possible';
     const impacts = shellImpact(command, options);
     if (impacts.length === 0) return 'possible';
-    // Only plain reads and read-only checks keep old verifications valid. A
-    // build or a write-capable segment means the implementation may have
-    // changed; an unknown command is graded conservatively.
-    if (impacts.every((impact) => impact === 'read-only' || impact === 'test' || impact === 'lint')) {
+    // 只读查看、测试、lint 与纯构建都不改实现：构建写的是派生产物（dist/target），
+    // 源码没动，旧验证仍然有效。含写命令或无法识别的命令才按可能写入保守处理。
+    if (
+      impacts.every(
+        (impact) =>
+          impact === 'read-only' || impact === 'test' || impact === 'lint' || impact === 'build',
+      )
+    ) {
       return 'irrelevant';
     }
     return 'possible';

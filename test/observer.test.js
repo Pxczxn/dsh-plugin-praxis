@@ -504,7 +504,10 @@ test('changeImpact grades shell commands conservatively', () => {
   assert.equal(changeImpact('bash', { command: 'npx eslint src' }), 'irrelevant');
   assert.equal(changeImpact('bash', { command: 'npx eslint --fix src' }), 'possible');
   assert.equal(changeImpact('bash', { command: 'npm install x' }), 'possible');
-  assert.equal(changeImpact('bash', { command: 'npm run build' }), 'possible');
+  // 纯构建只写派生产物（dist/target），不改实现：既不算可能写入，也要能充当验收证据。
+  assert.equal(changeImpact('bash', { command: 'npm run build' }), 'irrelevant');
+  assert.equal(changeImpact('bash', { command: 'cargo build' }), 'irrelevant');
+  assert.equal(changeImpact('bash', { command: 'npm run build && node deploy.js' }), 'possible');
   assert.equal(changeImpact('bash', { command: 'mkdir -p out' }), 'possible');
   assert.equal(changeImpact('bash', { command: 'ls && rm -rf dist' }), 'possible');
   assert.equal(changeImpact('bash', { command: 'echo hello > out.txt' }), 'possible');
@@ -612,6 +615,8 @@ test('npm run 只在脚本体可确认时放宽，自定义脚本仍然算可能
           check: 'node --test',
           syntax: 'node --check index.js',
           lint: 'eslint .',
+          build: 'vite build',
+          buildthenrun: 'vite build && node deploy.js',
           bench: 'node bench/bench.js',
           deploy: 'node deploy.js && rm -rf dist',
         },
@@ -627,6 +632,12 @@ test('npm run 只在脚本体可确认时放宽，自定义脚本仍然算可能
     assert.equal(classifyTool('bash', { command: 'npm run syntax' }, { cwd: dir }), 'lint');
     assert.equal(changeImpact('bash', { command: 'npm run syntax' }, { cwd: dir }), 'irrelevant');
     assert.equal(changeImpact('bash', { command: 'node --check index.js' }, { cwd: dir }), 'irrelevant');
+
+    // 纯构建脚本展开后是 build：产物不属于实现，不能卡住结项。
+    assert.equal(classifyTool('bash', { command: 'npm run build' }, { cwd: dir }), 'build');
+    assert.equal(changeImpact('bash', { command: 'npm run build' }, { cwd: dir }), 'irrelevant');
+    // 构建后面追加无法识别的命令：仍然保守。
+    assert.equal(changeImpact('bash', { command: 'npm run buildthenrun' }, { cwd: dir }), 'possible');
 
     // bench 跑的是项目自己写的 JS，可能写文件，不能一律当只读。
     assert.equal(classifyTool('bash', { command: 'npm run bench' }, { cwd: dir }), 'other');

@@ -334,6 +334,40 @@ test('引用测试观察的 passed 验证被记录为 observed', async () => {
   assert.equal(response.data.acceptance[0].covered, true);
 });
 
+test('build 观察可以作为 passed 证据，且不会进待复核写入', async () => {
+  const { engine, state } = setup();
+  const { taskId, criterionId } = await readyToVerify(engine);
+  await engine.task(ctx, { action: 'step', task_id: taskId, phase: 'verify' });
+
+  const build = addObservation(state, taskId, {
+    kind: 'build',
+    changeImpact: 'irrelevant',
+    tool: 'npm run build',
+    callSummary: 'npm run build',
+    resultSummary: 'built in 1.2s',
+  });
+  const task = state.tasks.find((item) => item.id === taskId);
+  assert.deepEqual(task.pendingChangeIds, [], '构建观察不能进待复核写入');
+
+  const response = await engine.task(ctx, {
+    action: 'verify',
+    task_id: taskId,
+    level: 'passed',
+    scope: 'npm run build',
+    coverage: [{ criterionId, result: 'passed', observationIds: [build.id] }],
+  });
+  assert.equal(response.ok, true, JSON.stringify(response));
+
+  // 构建型任务不再因为“跑过构建”而永远差一条待复核写入。
+  const closed = await engine.task(ctx, {
+    action: 'close',
+    task_id: taskId,
+    outcome: 'done',
+    implementationStatus: 'complete',
+  });
+  assert.equal(closed.ok, true, JSON.stringify(closed));
+});
+
 test('not_run 需要说明原因', async () => {
   const { engine } = setup();
   const { taskId, criterionId } = await readyToVerify(engine);
