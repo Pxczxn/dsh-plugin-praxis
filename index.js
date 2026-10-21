@@ -69,6 +69,7 @@ export function apply(ctx, config) {
   ];
 
   const degraded = [];
+  const warnings = [];
   for (const [label, attach] of [
     ['observer', attachObserver],
     ['lifecycle', attachLifecycle],
@@ -78,6 +79,7 @@ export function apply(ctx, config) {
       if (typeof dispose === 'function') {
         disposers.push(dispose);
         if (dispose.degraded) degraded.push(`${label}:${dispose.degraded}`);
+        if (Array.isArray(dispose.warnings)) warnings.push(...dispose.warnings);
       } else if (dispose && typeof dispose === 'object' && dispose.degraded) {
         degraded.push(`${label}:${dispose.degraded}`);
       }
@@ -88,6 +90,9 @@ export function apply(ctx, config) {
   }
   if (degraded.length > 0) {
     warn(ctx, `degraded to manual tool mode: ${degraded.join(', ')}`);
+  }
+  if (warnings.length > 0) {
+    warn(ctx, `hook warnings: ${[...new Set(warnings)].join(', ')}`);
   }
 
   return () => {

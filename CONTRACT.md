@@ -2,7 +2,7 @@
 
 > 当前实现版本 1.0.0。本文保留 v0.2.1 基线，并已并入 v0.2.3（summary）与 v1.0（提示通道、implRevision、dataDir）的行为。
 
-依据 `Praxis-DESIGN-v0.2.1.md`。纯 ESM JS（Node >= 20，无第三方依赖）。所有模块只 import `./evidence.js`、`./classify.js` 或 node 内置。
+依据 `Praxis-DESIGN-v0.2.1.md`。纯 ESM JS（Node >= 20，无第三方依赖）。模块之间只 import 本目录模块或 node 内置；`lifecycle.js` 复用 `engine.js` 导出的 `readinessOf`，`engine.js` 不反向依赖 `lifecycle.js`。
 
 ## 0. 通用约定
 
@@ -121,21 +121,48 @@ export function contextOf(exec, ctx, store)   // async → { sessionId, agentId,
 ## 7. `src/lifecycle.js`
 
 ```js
-export function attachLifecycle(ctx, store)   // systemPrompt.section + agent/pre-step + agent/turn-stopping，返回 dispose
+export function attachLifecycle(ctx, store)   // systemPrompt.section + 会话级 context + agent/pre-step + agent/turn-stopping，返回 dispose
 export const GUIDANCE                       // 静态段落文本
 export function classifyRequest(text)       // 'applicable' | 'not_applicable' | 'uncertain'
 ```
 
-- `ctx.systemPrompt.section({ name: 'praxis', order: 9500, text: GUIDANCE })`；`ctx.systemPrompt` 不存在时返回 `{ degraded: 'hook-unavailable' }` 且不抛。
-- `ctx.on('agent/pre-step', async (payload, next) => {...})`：只在每轮第一步计算，只对 `classifyRequest(...) === 'applicable'` 的**用户轮次**写提示；去重键 `sessionId + turn`，文本写进 `state.sessions[sessionId].praxisHint`，**不改写消息列表**（返回 `{ kind: 'enter', messages }` 会把插件的话渲染成用户气泡，已废弃）；每轮结束都调 `next()`。
-- `ctx.systemPrompt.context({ name: 'praxis:hint', order: 150, text })`：请求前按 `context.agent.session` 同步求值，读 `store.read()` 里的 `praxisHint`；`systemPrompt.context` 不存在时记 `prompt-context` 降级。
-- `ctx.on('agent/turn-stopping', async (payload) => {...})`：`observe` 模式，只记录诊断，不发消息、不续步。
-- 任一钩子接线抛错 → 返回 degraded 标识，不吞错假装启用。
+- `ctx.systemPrompt.section({ name: 'praxis', order: 9500, text: GUIDANCE, interpolate: false })`；`ctx.systemPrompt` 不存在时记 `system-prompt` 降级，继续其余接线，不抛。
+- 动态提示只走宿主运行时上下文，不修改消息列表：
+  - 全局兜底：`ctx.systemPrompt.context({ name: 'praxis:hint', order: 150, interpolate: false, text })`，`text(context)` 从 `context.agent ?? context.scope` 取 id（兼容 `agent.id` 与 `agent.session.id`），读 `store.read().sessions[id].praxisHint`。
+  - 会话级隔离：`agent/created` 时通过 `agent.ctx.systemPrompt.context()` 注册同名上下文，闭包绑定 `agent.id`；`agent/disposed` 时只移除属于该 agent 对象的注册；`attach` 时用 `agents.list()` 给已活着的 agent 补注册（热加载）。`scopedHints` 存 `{ agent, remove }`，同一 session id 的新 agent 会先撤旧注册再注册新的。scoped 注册遮蔽全局兜底，父子代理各自 scope。
+  - 不依赖 `context.agent.session` 作为键：宿主传入的是 Session 对象，不是 id（当前 0.2.1-rc.2 的 `assembleContextFor` 返回 `{ agent, scope: agent, signal }`）。
+  - 不在 attach 时 fire-and-forget `store.load()`：避免旧读盘结果覆盖首个 pre-step `mutate` 写入的缓存；首次请求前没有提示是正常空值。
+  - scoped 注册失败记 `dispose.warnings`（`agent-scope`），由 `index.js` warn；全局兜底仍可用。服务晚于插件提供时不会自动重试，需要重载插件。
+- `ctx.on('agent/pre-step', async (payload, next) => {...})`：
+  - 请求文本取**最后一条有效 user 消息**（剥掉宿主返程指引后非空；子代理回退到任务本身），不拼接父代理/历史消息。
+  - 只在每轮第一步（`step` 缺失或 `step <= 1`）计算；只对 `classifyRequest(...) === 'applicable'` 的用户轮次写提示；先清掉上轮残留，同轮重复调用保留原提示。同一轮后续 step 继续读同一段提示（本轮持续可见），不重复写状态。
+  - 只读/问答/规划/讨论：`classifyRequest` 先识别明确的只读口令（只读、不要改、先别改、只分析等）；冒号后的执行指令、明确祈使、执行序列仍可翻案。
+  - 闭环提醒优先：`session.closureHint` 存在时按 `taskId + phase + codes` 的稳定签名去重（`codes` 来自 `readinessOf`，证据 ID/摘要只进 detail，不参与签名）；`pending=false` 仅在 `readinessOf(task, 'complete')` 无 blocker 时成立，并提醒 `close`；只读请求不消费 `closureHint`。
+  - 经验提示：每会话一次（`lessonHintShown`），只匹配 `trigger`，要求英文强标识符或中文三元组锚点；只返回 top1。
+  - 通用提醒：每会话一次（`genericReminderCount`）；已经给过经验提示或闭环提醒时不再补通用提醒（闭环提醒也占用该配额）。
+  - 去重键 `sessionId + turn`，提示文本写进 `state.sessions[sessionId].praxisHint`，**不改写消息列表**（返回 `{ kind: 'enter', messages }` 会把插件的话渲染成用户气泡，已废弃）；每轮结束都调 `next()`。
+- `ctx.on('agent/turn-stopping', async (payload) => {...})`：`observe` 模式，只记录诊断（`closureHint { taskId, pending, detail, codes, phase }`、`turnStops`），不发消息、不续步；诊断对象取本会话最近更新的 open 任务；无 open 任务时清空 `closureHint` 与 `lastClosureSignature`。
+- `closureGaps(task, state)` 复用 `readinessOf(task, 'complete')`：phase、implementationStatus、活跃验收项、人工验收项、待复核写入、当前 revision 的覆盖、stale 验证都与 `close(done)` 同源；缺口是 `uncovered`/`stale` 时附加最近可用证据 ID。
+- `classifyRequest`：只读/规划/讨论/疑问优先；明确执行指令（`帮我修复`、`检查一下：优化…`、`整理一下然后修复`）仍适用；英文动作词按 `\b` 匹配（`prefix`/`fixture` 不算 `fix`）；斜杠只识别 `/help` 这类命令，不把绝对路径当命令。
+- 会话与项目上下文由 `sessionContext` 提供；子代理会话的 `projectKey` 为空。
+- 任一钩子接线抛错 → 返回 degraded 标识（`system-prompt`、`prompt-context`、`agent-scope`、`hooks`），不吞错假装启用。
+
+## 7.1 `readinessOf`（`src/engine.js` 导出）
+
+```js
+export function readinessOf(task, implementationStatus = task.implementationStatus)
+// → { blockers: string[], codes: string[], uncovered: string[], manual: string[] }
+```
+
+`close(done)` 与生命周期提醒共用这一份门槛。`codes` 是稳定类别（`phase`、`implementation`、`no-acceptance`、`manual`、`pending`、`uncovered`、`stale`），供提醒去重；`blockers` 是给人看的文本。生命周期用 `implementationStatus='complete'` 预演“如果按 complete 结项”，close 在写入入参状态后使用任务上的真实值。
+
+
 
 ## 8. `src/engine.js`（Lead 负责，接口供 tools.js 使用）
 
 ```js
 export function createEngine(store)
+export function readinessOf(task, implementationStatus = task.implementationStatus)
 // engine.task(ctx, args)  → Promise<{ok,...}>
 // engine.lesson(ctx, args) → Promise<{ok,...}>
 // ctx: { sessionId, agentId, projectKey }
@@ -155,7 +182,7 @@ v0.2.3 增补：只读动作 `summary` 提供跨任务聚合（`tasks.byPhase`/`
 
 - `test/store.test.js`（队友 A）：锁竞争、损坏拒写、版本拒绝、原子写失败不破坏原文件、并发 mutate。
 - `test/observer.test.js`（队友 B）：缺身份不记录、去重、唯一活动任务归属、confirmed 使验证失效、possible 进 pending、容量不删被引用。
-- `test/lifecycle.test.js`（队友 C）：适用性分类、pre-step 每轮只注入一次、section 注册、钩子缺失降级。
+- `test/lifecycle.test.js`（队友 C）：适用性分类（只读/讨论/疑问/执行序列/冒号指令/只读口令/多消息最后意图）、agent/created 的 scoped 上下文注册与父子隔离、同 id 重建、热加载补注册、pre-step 每轮只提示一次、通用/经验/闭环去重、闭环缺口与真实 `readinessOf`/`close(done)` 一致、只读不催收尾、section 注册、钩子缺失降级。
 - `test/engine.test.js`、`test/lesson.test.js`、`test/plugin.test.js`（Lead）：A/B/D/E 组契约与工具 schema 装配。
 
 ## 11. 硬性禁止

@@ -347,18 +347,59 @@ function coverageRows(task, coverage) {
 }
 
 function verifiedAcceptanceIds(task) {
-  const current = task.verificationHistory.filter(
+  const history = Array.isArray(task.verificationHistory) ? task.verificationHistory : [];
+  const current = history.filter(
     (item) => item.valid && item.revision === task.revision,
   );
   const passed = new Map();
   for (const verification of current) {
-    for (const row of verification.coverage) {
+    for (const row of verification.coverage ?? []) {
       if (row.result === 'passed' && row.observationIds.length > 0) {
         passed.set(row.criterionId, verification);
       }
     }
   }
   return passed;
+}
+
+/**
+ * 距离 close(done) 还差什么。
+ *
+ * `implementationStatus` 可覆盖任务当前记录：生命周期提醒用 'complete' 预演「如果按
+ * complete 结项」是否只差这些项；close 本身在提交实施状态之后再用任务上的值检查。
+ * 返回的 codes 与 blockers 一一对应，供提醒去重使用稳定类别，不携带会变化的证据摘要。
+ */
+export function readinessOf(task, implementationStatus = task.implementationStatus) {
+  const blockers = [];
+  const codes = [];
+  const add = (code, text) => {
+    blockers.push(text);
+    codes.push(code);
+  };
+  const acceptance = Array.isArray(task.acceptance) ? task.acceptance : [];
+  const history = Array.isArray(task.verificationHistory) ? task.verificationHistory : [];
+  const pendingChangeIds = Array.isArray(task.pendingChangeIds) ? task.pendingChangeIds : [];
+  if (task.phase !== 'verify') add('phase', `任务处于 ${task.phase ?? 'understand'}，未进入 verify`);
+  if (implementationStatus !== 'complete') {
+    add('implementation', `implementationStatus=${implementationStatus}，done 需要 complete`);
+  }
+  const active = acceptance.filter((item) => item.active);
+  if (active.length === 0) add('no-acceptance', '没有活跃验收项');
+  const manual = active.filter((item) => item.kind === 'manual');
+  if (manual.length > 0) {
+    add('manual', `存在人工验收项，无法由模型自述完成：${manual.map((item) => item.id).join(', ')}`);
+  }
+  if (pendingChangeIds.length > 0) {
+    add('pending', `存在未解除的可能写入：${pendingChangeIds.join(', ')}`);
+  }
+  const passed = verifiedAcceptanceIds(task);
+  const uncovered = active.filter((item) => !passed.has(item.id)).map((item) => item.id);
+  if (uncovered.length > 0) add('uncovered', `未由当前 revision 复验覆盖：${uncovered.join(', ')}`);
+  const stale = history.filter(
+    (item) => item.valid && item.revision !== task.revision,
+  );
+  if (stale.length > 0) add('stale', `存在 revision 不匹配的验证：${stale.length} 条`);
+  return { blockers, codes, uncovered, manual: manual.map((item) => item.id) };
 }
 
 function digestArgs(args) {
@@ -916,29 +957,6 @@ export function createEngine(store) {
     );
   }
 
-  function readiness(task) {
-    const blockers = [];
-    if (task.phase !== 'verify') blockers.push(`任务处于 ${task.phase}，未进入 verify`);
-    if (task.implementationStatus !== 'complete') {
-      blockers.push(`implementationStatus=${task.implementationStatus}，done 需要 complete`);
-    }
-    const active = task.acceptance.filter((item) => item.active);
-    if (active.length === 0) blockers.push('没有活跃验收项');
-    const manual = active.filter((item) => item.kind === 'manual');
-    if (manual.length > 0) blockers.push(`存在人工验收项，无法由模型自述完成：${manual.map((item) => item.id).join(', ')}`);
-    if (task.pendingChangeIds.length > 0) {
-      blockers.push(`存在未解除的可能写入：${task.pendingChangeIds.join(', ')}`);
-    }
-    const passed = verifiedAcceptanceIds(task);
-    const uncovered = active.filter((item) => !passed.has(item.id)).map((item) => item.id);
-    if (uncovered.length > 0) blockers.push(`未由当前 revision 复验覆盖：${uncovered.join(', ')}`);
-    const stale = task.verificationHistory.filter(
-      (item) => item.valid && item.revision !== task.revision,
-    );
-    if (stale.length > 0) blockers.push(`存在 revision 不匹配的验证：${stale.length} 条`);
-    return { blockers, uncovered, manual: manual.map((item) => item.id) };
-  }
-
   function close(ctx, state, args) {
     const task = ensureOpen(findTask(state, requiredString(args, 'task_id', 80)));
     const outcome = oneOf(requiredString(args, 'outcome', 20), OUTCOMES, 'outcome');
@@ -957,7 +975,7 @@ export function createEngine(store) {
     task.implementationStatus = implementationStatus;
 
     if (outcome === 'done') {
-      const { blockers } = readiness(task);
+      const { blockers } = readinessOf(task);
       if (blockers.length > 0) {
         throw new PraxisError('gate', '不满足 close(done) 门槛', {
           hint: blockers.join('；'),
@@ -1091,7 +1109,7 @@ export function createEngine(store) {
       at: item.at,
       coverage: item.coverage,
     }));
-    const { blockers, uncovered } = readiness(task);
+    const { blockers, uncovered } = readinessOf(task);
     return ok({
       task: summarizeTask(task),
       acceptance: acceptanceView(task),
@@ -1157,7 +1175,7 @@ export function createEngine(store) {
       .slice(0, MAX_SUMMARY_TASKS);
 
     const open = recent.map((task) => {
-      const { blockers, uncovered } = readiness(task);
+      const { blockers, uncovered } = readinessOf(task);
       const active = task.acceptance.filter((item) => item.active);
       return {
         task_id: task.id,

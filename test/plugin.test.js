@@ -97,6 +97,11 @@ test('apply 挂载观察者、生命周期提示段与回合提醒', async () =>
     const events = listeners.map((item) => item.event);
     // 观察者只需要工具结果事件；pre-execute 不是必需通道。
     assert.ok(events.includes('tools/result'));
+    // 生命周期钩子：会话级提示注册、清理与每轮提醒。
+    assert.ok(events.includes('agent/created'));
+    assert.ok(events.includes('agent/disposed'));
+    assert.ok(events.includes('agent/pre-step'));
+    assert.ok(events.includes('agent/turn-stopping'));
   } finally {
     await cleanup();
   }
