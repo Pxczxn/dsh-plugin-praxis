@@ -1,6 +1,6 @@
 # Praxis v0.2.1 实现契约（内部，供并行开发对齐）
 
-> 当前实现版本 1.0.0。本文保留 v0.2.1 基线，并已并入 v0.2.3（summary）与 v1.0（提示通道、implRevision、dataDir）的行为。
+> 当前实现版本 1.0.1（测试版）。本文保留 v0.2.1 基线，并已并入 v0.2.3（summary）、v1.0（提示通道、implRevision、dataDir）与 v1.0.1（提示按会话隔离、触发分类与闭环门槛收紧）的行为。
 
 依据 `Praxis-DESIGN-v0.2.1.md`。纯 ESM JS（Node >= 20，无第三方依赖）。模块之间只 import 本目录模块或 node 内置；`lifecycle.js` 复用 `engine.js` 导出的 `readinessOf`，`engine.js` 不反向依赖 `lifecycle.js`。
 
