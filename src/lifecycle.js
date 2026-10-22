@@ -6,7 +6,7 @@ import { resolveService, sessionContext } from './context.js';
 export const GUIDANCE = [
   'Praxis 是宿主内的任务与经验台账（工具 praxis_task 与 praxis_lesson）。',
   '1) 非平凡代码任务开始时先 start 记录目标与已知验收项；没有活跃验收项的任务不能以 done 结项。',
-  '2) 动手改代码前，先调查现有实现，用 need/inventory 记录复用、扩展或新增的判断连同证据（文件:行号、命令与关键输出）；弱证据会被拒绝。',
+  '2) 动手改代码前先调查：need 是调查后的结论，不是待调查清单；没有结论先查，不要先填 reuse/extend/new 占位，也不要为数量或形式完整而登记。按独立决策目标记录判断与证据（文件:行号、命令与关键输出）；判断、证据、处理一致的目标可合并，但 target 要写明覆盖范围，不要为凑数拆分文件或方法；弱证据只说明还没查完，不能当作结论或进入实现的依据。new 要写清检查过的现有能力及不适用原因；结论形成后把未确认范围写进该 need 的 plan，不假装调查完整。只读、讨论、规划轮次不用 start。',
   '3) 声称完成或修复前，把真实验证结果用 verify 映射到验收项；passed 必须引用宿主记录的观察 ID。',
   '4) 验证之后又改文件，先前验证会失效，需要重新验证。',
   '5) 跑完最后一轮测试就当场 verify 并 close，不要攒到下一轮：会话可能在你收尾之前结束。',
@@ -15,7 +15,7 @@ export const GUIDANCE = [
 ].join('\n');
 
 export const REMINDER =
-  '[Praxis] 如果本轮要改代码：非平凡任务先用 praxis_task start 记录目标与验收项；调查后用 need 记录复用/扩展/新增判断与证据；声称完成前先 verify 并引用观察 ID，再 close。任务不涉及代码改动时忽略本条。';
+  '[Praxis] 如果本轮要改代码：非平凡任务先用 praxis_task start 记录目标与验收项；调查后按独立目标用 need 记录复用/扩展/新增结论与证据，need 不是待调查清单，未查清不要先填 decision 占位，也不要为凑数登记；new 要说明检查过的现有能力及不适用原因；声称完成前先 verify 并引用观察 ID，再 close。只读、讨论、规划轮次忽略本条。';
 
 // 明确动手的动词：出现就可以按改动任务提醒。
 const ACTION_VERBS = [

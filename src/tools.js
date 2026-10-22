@@ -4,12 +4,12 @@ import { PraxisError } from './evidence.js';
 export const TASK_NAME = 'praxis_task';
 export const LESSON_NAME = 'praxis_lesson';
 
-export const TASK_DESCRIPTION = `记录一个开发任务的调查判断、阶段、验证与结项。用于非平凡代码任务的开始、调查结论、阶段推进和结项。
+export const TASK_DESCRIPTION = `记录一个开发任务的调查判断、阶段、验证与结项。用于非平凡代码任务；只读、讨论、规划不必调用。
 
 动作：
 - start(goal, acceptance[]?, projectKey?)：创建任务；可先不登记验收项，但没有活跃验收项不能 close(done)
-- need(task_id, target, decision, evidence)：记录对一个改动目标的复用判断（reuse/extend/new）与调查依据；弱证据会被警告且不能通过进入实现的门槛
-- inventory(task_id, needs[]?, acceptance[]?, change_reason?)：批量调整调查结论和验收项；修改验收项必须给 change_reason
+- need(task_id, target, decision, evidence)：记录对一个改动目标的复用判断（reuse/extend/new）与调查依据；need 是调查后的结论，不是待调查清单，未查清不要先填 decision 占位，也不要为数量或形式完整登记；独立决策目标分别记录，判断/证据/处理一致的可合并但 target 要写明覆盖范围；new 要说明检查过的现有能力及不适用原因；结论形成后把未确认范围写进 plan；弱证据会被警告且不能通过进入实现的门槛
+- inventory(task_id, needs[]?, acceptance[]?, change_reason?)：批量调整调查结论和验收项；needs 的粒度规则同 need；修改验收项必须给 change_reason
 - step(task_id, phase, note?)：understand → implement → verify 前进或回退；回退必须给 note
 - verify(task_id, level, scope, coverage[], evidence?, note?)：把验证结果映射到验收项；passed 的每一项必须引用宿主观察 ID（先用 status 查看候选）
 - close(task_id, outcome, implementationStatus, closureReason?, note?, lesson?, lesson_id?)：done 需要当前 revision 对全部活跃验收项有可信通过记录；等待人工验收用 partial + complete + awaiting_manual

@@ -56,6 +56,16 @@ Praxis 给 DSH 加上一套**任务台账**与**可检索的错题本**：它不
 - `close(done)` 要求：阶段已在 `verify`、`implementationStatus=complete`、没有待复核的写入、当前 revision 的每条活跃验收项都有 `passed` 覆盖，且验证之后没有新的确认写入。
 - 等待人工验收用 `close(partial)` + `implementationStatus=complete` + `closureReason=awaiting_manual`。
 
+### 调查粒度（阶段 A 软引导）
+
+- `need` 记录的是调查后的结论，不是待调查清单。没有结论时先调查，不要先填 `reuse`/`extend`/`new` 占位，也不要为数量或形式完整而登记；弱证据只表示还没查完。
+- 以“独立决策目标”为单位登记 `need`，目标可以是功能、模块、接口、服务、组件、方法或共享能力；两个接口需要不同处理时，`target` 要能区分它们（例如“接口 A 的序列化”和“接口 B 的序列化”）。
+- 判断、证据与处理方式一致的目标可以合并，但必须在 `target` 文本里写明覆盖范围；不要为了凑数量机械拆分文件或方法。
+- `new` 的 `evidence` 要写清检查过的现有能力（文件:行号）以及为何不适用；阶段 A 只做文案引导，不校验措辞。
+- 尚未确认的范围和潜在影响写进 `plan`，不要假装调查完整；扩大调查后可用 `need`/`inventory` 更新，`implement` 阶段会递增 revision 并使旧验证失效。
+- 只读、讨论、规划轮次不必 `start`；这条不改变现有提示分类器。
+- 以上是软约束：现有硬门槛仍是“至少一条 `need` 是具体证据”，不按目标逐条校验；合并覆盖、稳定 ID、`covers`、`active` 留待阶段 B。
+
 ### `praxis_lesson` — 错题本
 
 | 动作 | 用途 |

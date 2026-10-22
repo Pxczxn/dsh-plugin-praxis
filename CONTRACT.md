@@ -147,6 +147,13 @@ export function classifyRequest(text)       // 'applicable' | 'not_applicable' |
 - 会话与项目上下文由 `sessionContext` 提供；子代理会话的 `projectKey` 为空。
 - 任一钩子接线抛错 → 返回 degraded 标识（`system-prompt`、`prompt-context`、`agent-scope`、`hooks`），不吞错假装启用。
 
+### 7.0.1 调查粒度（阶段 A 软引导）
+
+- `GUIDANCE` 第 2 条与 `TASK_DESCRIPTION` 明确：按独立决策目标登记 `need`；判断、证据、处理一致的目标可合并，但 `target` 要写明覆盖范围；不要为凑数拆分文件或方法；`new` 要写清检查过的现有能力及不适用原因；未确认范围写 `plan`；只读、讨论、规划轮次不必 `start`。
+- `need` 是调查后的结论，不是待调查清单。未查清时不得先填 `reuse`/`extend`/`new` 占位，也不得为数量/形式完整而登记；弱证据只表示调查未完成，不能当作结论。
+- 阶段 A 不改变 `need`/`inventory` schema、状态机、`step(understand → implement)` 的“至少一条 concrete `need`”门槛和 `close(done)` 门槛；不增加 `covers`、稳定 `need.id` 或 `active` 字段，也不校验 `target` 的覆盖范围。
+- 因此阶段 A 只能证明文案已注入、现有规则未被破坏；不能证明真实调查充分，也不能证明 Agent 不会遗漏未登记的目标。相关行为对照见 `docs/phase-a-baseline.md`，并且必须标注为代理测试。
+
 ## 7.1 `readinessOf`（`src/engine.js` 导出）
 
 ```js
