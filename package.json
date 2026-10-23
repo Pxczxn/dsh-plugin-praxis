@@ -20,7 +20,7 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check index.js && node --check src/evidence.js && node --check src/store.js && node --check src/engine.js && node --check src/tools.js && node --check src/observer.js && node --check src/classify.js && node --check src/lifecycle.js && node --check src/context.js"
+    "check": "node --check index.js && node --check src/evidence.js && node --check src/store.js && node --check src/engine.js && node --check src/trust.js && node --check src/tools.js && node --check src/observer.js && node --check src/classify.js && node --check src/lifecycle.js && node --check src/context.js"
   },
   "dsh": {
     "bundle": {
