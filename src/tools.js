@@ -37,6 +37,8 @@ const acceptanceItem = {
     source: { type: 'string', enum: ['user_explicit', 'agent_proposed'] },
     kind: { type: 'string', enum: ['automated', 'manual'] },
     active: { type: 'boolean', description: 'false 表示停用（必须给 change_reason）' },
+    protected: { type: 'boolean', description: 'true 表示受保护项：建立/修改/停用都需要真实用户确认' },
+    confirmation_call_id: { type: 'string', description: '用户确认的 callId（timed ask_user_question 的 pending 结果返回值）；user_explicit 与 protected 必须提供' },
   },
 };
 

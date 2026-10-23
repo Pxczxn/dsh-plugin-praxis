@@ -32,6 +32,7 @@ export function emptyState() {
     observations: [],
     requests: [],
     lessons: [],
+    confirmations: [],
     sessions: {},
   }
 }

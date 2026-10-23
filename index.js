@@ -12,6 +12,7 @@ import {
 } from './src/tools.js';
 import { attachObserver } from './src/observer.js';
 import { attachLifecycle } from './src/lifecycle.js';
+import { attachTrust } from './src/trust.js';
 import { contextOf, resolveService } from './src/context.js';
 
 export const name = 'dsh-plugin-praxis';
@@ -73,6 +74,7 @@ export function apply(ctx, config) {
   for (const [label, attach] of [
     ['observer', attachObserver],
     ['lifecycle', attachLifecycle],
+    ['trust', attachTrust],
   ]) {
     try {
       const dispose = attach(ctx, store);

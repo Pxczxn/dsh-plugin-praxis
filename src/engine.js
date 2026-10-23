@@ -12,6 +12,7 @@ import {
   relevance,
   similarity,
 } from './evidence.js';
+import { findUsableConfirmation, consumeConfirmation, confirmationDigest, isAffirmativeAnswer } from './trust.js';
 
 export const PHASES = ['understand', 'implement', 'verify'];
 export const OUTCOMES = ['done', 'partial', 'abandoned'];
@@ -171,7 +172,135 @@ function summarizeLesson(lesson) {
   };
 }
 
-function normalizeAcceptance(items, existing = [], warnings = []) {
+/**
+ * M1：验收项的来源与保护语义。
+ *
+ * 可信边界：模型在工具参数里自报的 source:user_explicit / protected:true 不能单独
+ * 建立信任（criterion-1）。两条路径：
+ * - 修订/新建时由调用方（start/inventory）先做授权核对，再传入 normalize；
+ * - 旧 state 里已经是 user_explicit 的项保持原样（兼容，不自动升级也不自动降级）。
+ */
+/**
+ * M1 受保护项授权核对（criterion-2/3/4/5）。必须在调用方的 mutate 事务内执行：
+ * 查找→校验→消费一步完成，锁保证原子性。
+ *
+ * 授权绑定：callId 必须 ① 存在于本任务 state.confirmations（宿主 user-question-reply
+ * 事件登记）；② 属于当前会话（跨会话/子代理无效）；③ 未被消费（防重放）；④
+ * 用户回答覆盖到本次变更（变更描述作为问题文本出现在该次提问里）。
+ */
+function requireProtectedConfirmation(ctx, state, criterionId, { before, after, changeReason, change, callId: explicitCallId }) {
+  // callId 优先取验收项自带的 confirmation_call_id；顶层 ctx 通道仅作兼容兜底。
+  const callId = explicitCallId ?? ctx?.__pendingConfirmationCallId ?? null;
+  if (!callId || typeof callId !== 'string') {
+    throw new PraxisError('confirmation-required', `受保护验收项 ${criterionId} 的修改需要用户授权`, {
+      hint: '先 ask_user_question（timed）向用户描述本次修改，用户确认后带 confirmation_call_id 重新提交',
+    });
+  }
+  const sessionId = ctx?.sessionId ?? null;
+  const record = findUsableConfirmation(state, sessionId, callId);
+  if (!record) {
+    throw new PraxisError('confirmation-invalid', `确认 ${clip(callId, 80)} 不存在、已消费或不属于当前会话`, {
+      hint: 'confirmation_call_id 必须来自本会话内一次真实 ask_user_question 回答，且未被使用过',
+    });
+  }
+  // ④ 变更内容与用户确认的问题对应（M2.5 完整变更匹配）。仅要求
+  // asked.includes(after.text) 无法防止「确认了长文本、提交其弱化子串」的
+  // 偏移（子串同样是长文本的子串）。因此：
+  //   · 文本被修改（before.text !== after.text）：按引导模板把确认问题中的
+  //     【变更段】提取出来做【等值】比较——问题必须能定位出与本次提交完全
+  //     一致的新文本；提取不到（不遵循模板）一律拒（fail-closed）。
+  //   · 停用/恢复（文本不变，active 变化）：文本内容无弱化空间，要求问题
+  //     包含 criterionId 与完整验收文本即可（gate 还核对结果状态与授权记录）。
+  const keyText = normalizeQuestionText(after?.text ?? '');
+  const textChanged = normalizeQuestionText(before?.text ?? '') !== keyText;
+  const covered = record.questions.some((item) => {
+    const asked = normalizeQuestionText(item?.question);
+    if (asked === '') return false;
+    if (!asked.includes(criterionId)) return false;
+    if (keyText === '') return true; // 纯删除类变更：id 覆盖即可
+    if (!textChanged) return asked.includes(keyText); // 停用/恢复：文本未变
+    // 文本修改：提取确认问题中的新文本，要求与提交文本等值。
+    const extracted = extractConfirmedText(asked, criterionId, keyText);
+    return extracted !== null && extracted === keyText;
+  });
+  if (!covered) {
+    throw new PraxisError('confirmation-mismatch', `确认 ${clip(callId, 80)} 的问题文本未完整对应验收项 ${criterionId} 的本次变更（需要与提交文本一致的完整内容）`, {
+      hint: '提问必须逐字引用变更后的完整验收文本，例如「将 criterion-1 修订为：<完整文本>，是否同意？」；不得省略或截断',
+    });
+  }
+  // M2：宿主对「拒绝」与「同意」都产生 outcome:'answered'（m2-reject.mjs 实测），
+  // 这里必须核对所选选项语义，否则用户拒绝也会被当成授权。
+  if (!isAffirmativeAnswer(record)) {
+    throw new PraxisError('confirmation-rejected', `确认 ${clip(callId, 80)} 的用户回答不是同意（拒绝/取消不能作为授权）`, {
+      hint: '只有用户明确选择同意（如「同意」「确认」）的确认才能授权修改受保护验收项',
+    });
+  }
+  consumeConfirmation(state, record, `acceptance:${criterionId}`);
+  // 同一 mutate 事务内的临时通道：调用方取走后写进 task.confirmationHistory。
+  // ctx 是每次工具调用新建的对象，不会跨请求泄漏。
+  if (!Array.isArray(ctx.__consumedConfirmations)) ctx.__consumedConfirmations = [];
+  ctx.__consumedConfirmations.push({
+    criterionId,
+    callId,
+    change: change ?? 'modify',
+    at: new Date().toISOString(),
+  });
+  return record;
+}
+
+function describeChange(before, after, changeReason) {
+  const parts = [];
+  if (before.text !== after.text) parts.push(`文本「${before.text}」→「${after.text}」`);
+  if (before.source !== after.source) parts.push(`来源 ${before.source}→${after.source}`);
+  if (before.kind !== after.kind) parts.push(`类型 ${before.kind}→${after.kind}`);
+  if (before.active !== after.active) parts.push(after.active ? '重新启用' : '停用');
+  if (changeReason) parts.push(String(changeReason).slice(0, 200));
+  return parts.join('；') || '建立保护';
+}
+
+function normalizeQuestionText(text) {
+  return String(text ?? '').replace(/\s+/g, ' ').trim();
+}
+
+// M2.5：从确认问题文本中提取 criterionId 对应的【变更段】，供与提交的完整
+// 验收文本做等值比较。提取策略（按引导模板，依次尝试，命中即返回）：
+//   a) A→B 修订式：提取「由「X」修改为「Y」」中的新文本 Y；
+//   b) 直接式：id 后跳过引导词（修订为/为/：），取到模板边界
+//     （（保护）/问句标点/是否同意）之前的完整文本。
+// 提取不到或不完整时返回 null（fail-closed）。
+// keyText 用于边界截断的回退判定（验收文本自身含边界字符时不误截）。
+function extractConfirmedText(asked, criterionId, keyText) {
+  const idx = asked.indexOf(criterionId);
+  if (idx === -1) return null;
+  const cleaned = normalizeQuestionText(keyText);
+  if (cleaned === '') return null;
+
+  // a) 修订式：...由「old」修改为「new」... ——"new" 必须与 keyText 等值。
+  const revise = asked.match(/[「\"]([^「」\"]+)[」\"]\s*(?:修改|变更|修订|改|调整为?|更新)\s*(?:为|成|到)?\s*[「\"]([^「」\"]+)[」\"]/);
+  if (revise && asked.slice(0, revise.index).includes(criterionId)) {
+    return revise[2].trim();
+  }
+
+  // b) 直接式：id 之后跳过引导词，取到模板边界之前。
+  let rest = asked.slice(idx + criterionId.length);
+  rest = rest.replace(/^[^：:]*[：:]\s*/, '').replace(/^\s*(修订|修改|新增|变更为|改为|为)\s*/, '');
+  if (rest === '') return null;
+  const boundary = /[（(]保护[）)]|[？?。！!]|是否同意|是否确认/;
+  const match = rest.match(boundary);
+  let segment = match ? rest.slice(0, match.index) : rest;
+  segment = segment.replace(/[\s，,、；;：:]+$/g, '').trim();
+  if (segment === '') return null;
+  // 若截断后不含完整 keyText（验收文本自身含边界字符被截断），回退到全文。
+  if (!segment.includes(cleaned) && rest.includes(cleaned)) segment = rest.trim();
+  return segment === '' ? null : segment;
+}
+
+function userExplicitAllowed(raw) {
+  return raw?.confirmation_call_id !== undefined && raw?.confirmation_call_id !== null;
+}
+
+function normalizeAcceptance(items, existing = [], warnings = [], ctx = null, state = null) {
+  const newConfirmations = [];
   const result = existing.map((item) => ({ ...item }));
   for (const raw of items) {
     if (!raw || typeof raw !== 'object') {
@@ -189,21 +318,86 @@ function normalizeAcceptance(items, existing = [], warnings = []) {
             hint: '新验收项必须给出 text',
           });
         }
+        // 新建：模型自报 user_explicit/protected 必须绑定真实用户确认（criterion-1）。
+        const wantedSource = oneOf(raw.source ?? 'agent_proposed', ['user_explicit', 'agent_proposed'], 'source');
+        const wantsProtected = raw.protected === true;
+        if ((wantedSource === 'user_explicit' || wantsProtected) && !userExplicitAllowed(raw)) {
+          if (wantedSource === 'user_explicit') {
+            warnings.push(`验收项 ${clip(explicitId, 80)} 标记 source=user_explicit 但没有真实用户确认（confirmation_call_id），已降级为 agent_proposed`);
+          }
+          if (wantsProtected) {
+            throw new PraxisError('confirmation-required', `验收项 ${clip(explicitId, 80)} 标记 protected=true 必须提供 confirmation_call_id`, {
+              hint: '受保护项的建立需要用户确认：先 ask_user_question（timed）让用户确认，再带 confirmation_call_id 提交',
+            });
+          }
+        }
+        // 受保护项建立时也做真实核对：确认存在、同会话、未消费、问题覆盖该验收文本。
+        if (wantsProtected && userExplicitAllowed(raw) && ctx && state) {
+          const record = requireProtectedConfirmation(ctx, state, explicitId, {
+            before: { text: null, source: null, kind: null, active: true },
+            after: { text, source: wantedSource, kind: oneOf(raw.kind ?? 'automated', ['automated', 'manual'], 'kind'), active: raw.active !== false, protected: true },
+            change: 'protect',
+            callId: raw.confirmation_call_id ?? null,
+          });
+          newConfirmations.push({ criterionId: explicitId, callId: record.callId, change: 'protect', at: new Date().toISOString() });
+        }
         result.push({
           id: clip(explicitId, 80),
           text,
-          source: oneOf(raw.source ?? 'agent_proposed', ['user_explicit', 'agent_proposed'], 'source'),
+          source: wantedSource === 'user_explicit' && !userExplicitAllowed(raw) ? 'agent_proposed' : wantedSource,
           kind: oneOf(raw.kind ?? 'automated', ['automated', 'manual'], 'kind'),
           active: raw.active !== false,
+          ...(wantsProtected && userExplicitAllowed(raw) ? { protected: true } : {}),
         });
         continue;
       }
+      // 修订已存在项：受保护项的任何改动（文本/来源/类型/停用/重新启用/身份）都要授权。
+      const wantsProtected = raw.protected === true || target.protected === true;
+      const modifiesProtected = target.protected === true;
+      const changesSomething =
+        (text !== null && text !== target.text) ||
+        (raw.source !== undefined && raw.source !== target.source) ||
+        (raw.kind !== undefined && raw.kind !== target.kind) ||
+        (raw.active !== undefined && (raw.active !== false) !== target.active);
+      if (modifiesProtected && changesSomething) {
+        const nextActive = raw.active === undefined ? target.active : raw.active !== false;
+        requireProtectedConfirmation(ctx, state, explicitId, {
+          before: { text: target.text, source: target.source, kind: target.kind, active: target.active },
+          after: {
+            text: text ?? target.text,
+            source: raw.source ?? target.source,
+            kind: raw.kind ?? target.kind,
+            active: nextActive,
+          },
+          change: nextActive === false ? 'deactivate' : 'modify',
+          callId: raw.confirmation_call_id ?? null,
+        });
+      }
+      // 非 protected 项升级为 protected 也算建立保护，需要授权。
+      if (target.protected !== true && raw.protected === true) {
+        requireProtectedConfirmation(ctx, state, explicitId, {
+          before: { text: target.text, source: target.source, kind: target.kind, active: target.active },
+          after: { text: text ?? target.text, source: raw.source ?? target.source, kind: raw.kind ?? target.kind, active: target.active, protected: true },
+          change: 'protect',
+          callId: raw.confirmation_call_id ?? null,
+        });
+      }
+      // 未授权的 user_explicit 自报对非受保护项只降级，不阻断（保持 v1.0.1 之外的旧行为宽松）。
+      if (raw.source === 'user_explicit' && !userExplicitAllowed(raw) && target.source !== 'user_explicit') {
+        warnings.push(`验收项 ${explicitId} 自报 source=user_explicit 未绑定用户确认，保持 ${target.source}`);
+      }
       if (text !== null) target.text = text;
       if (raw.source !== undefined) {
-        target.source = oneOf(raw.source, ['user_explicit', 'agent_proposed'], 'source');
+        const allowedExplicit = userExplicitAllowed(raw) || target.source === 'user_explicit';
+        target.source = oneOf(
+          allowedExplicit ? raw.source : (raw.source === 'user_explicit' ? 'agent_proposed' : raw.source),
+          ['user_explicit', 'agent_proposed'],
+          'source',
+        );
       }
       if (raw.kind !== undefined) target.kind = oneOf(raw.kind, ['automated', 'manual'], 'kind');
       if (raw.active !== undefined) target.active = raw.active !== false;
+      if (raw.protected === true && userExplicitAllowed(raw)) target.protected = true;
       continue;
     }
     if (!text) {
@@ -214,15 +408,37 @@ function normalizeAcceptance(items, existing = [], warnings = []) {
     const nextNumber = result.length + 1;
     let newId = `criterion-${nextNumber}`;
     while (result.some((item) => item.id === newId)) newId = `${newId}x`;
+    const wantedSource = oneOf(raw.source ?? 'agent_proposed', ['user_explicit', 'agent_proposed'], 'source');
+    const wantsProtected = raw.protected === true;
+    if ((wantedSource === 'user_explicit' || wantsProtected) && !userExplicitAllowed(raw)) {
+      if (wantedSource === 'user_explicit') {
+        warnings.push(`新验收项 ${newId} 标记 source=user_explicit 但没有真实用户确认（confirmation_call_id），已降级为 agent_proposed`);
+      }
+      if (wantsProtected) {
+        throw new PraxisError('confirmation-required', `新验收项 ${newId} 标记 protected=true 必须提供 confirmation_call_id`, {
+          hint: '受保护项的建立需要用户确认：先 ask_user_question（timed）让用户确认，再带 confirmation_call_id 提交',
+        });
+      }
+    }
+    if (wantsProtected && userExplicitAllowed(raw) && ctx && state) {
+      const record = requireProtectedConfirmation(ctx, state, newId, {
+        before: { text: null, source: null, kind: null, active: true },
+        after: { text, source: wantedSource, kind: oneOf(raw.kind ?? 'automated', ['automated', 'manual'], 'kind'), active: raw.active !== false, protected: true },
+        change: 'protect',
+        callId: raw.confirmation_call_id ?? null,
+      });
+      newConfirmations.push({ criterionId: newId, callId: record.callId, change: 'protect', at: new Date().toISOString() });
+    }
     result.push({
       id: newId,
       text,
-      source: oneOf(raw.source ?? 'agent_proposed', ['user_explicit', 'agent_proposed'], 'source'),
+      source: wantedSource === 'user_explicit' && !userExplicitAllowed(raw) ? 'agent_proposed' : wantedSource,
       kind: oneOf(raw.kind ?? 'automated', ['automated', 'manual'], 'kind'),
       active: raw.active !== false,
+      ...(wantsProtected && userExplicitAllowed(raw) ? { protected: true } : {}),
     });
   }
-  return result;
+  return { items: result, confirmations: newConfirmations, warnings };
 }
 
 function acceptanceChanges(before, after) {
@@ -399,6 +615,27 @@ export function readinessOf(task, implementationStatus = task.implementationStat
     (item) => item.valid && item.revision !== task.revision,
   );
   if (stale.length > 0) add('stale', `存在 revision 不匹配的验证：${stale.length} 条`);
+  // M1 criterion-2：受保护项被停用/替换但没有授权记录时，close(done) 必须拒绝。
+  // 授权记录只在修改发生时当场核对（requireProtectedConfirmation 已消费确认），
+  // 这里核对的是"结果状态"：受保护项停用但 confirmationHistory 里没有对应授权。
+  const confirmHistory = Array.isArray(task.confirmationHistory) ? task.confirmationHistory : [];
+  const deactivatedProtected = acceptance.filter(
+    (item) => item.protected === true && item.active === false,
+  );
+  for (const item of deactivatedProtected) {
+    const authorized = confirmHistory.some(
+      (entry) =>
+        entry &&
+        entry.criterionId === item.id &&
+        (entry.change === 'deactivate' || entry.change === 'replace' || entry.change === 'delete'),
+    );
+    if (!authorized) {
+      add(
+        'protected-deactivated',
+        `受保护验收项 ${item.id} 被停用但没有用户授权记录；不能通过停用受保护项绕过 done`,
+      );
+    }
+  }
   return { blockers, codes, uncovered, manual: manual.map((item) => item.id) };
 }
 
@@ -453,12 +690,16 @@ function remember(state, ctx, action, args, response) {
 
 function acceptanceView(task) {
   const passed = verifiedAcceptanceIds(task);
+  // 注意：不能输出 undefined 值属性（如 protected: undefined）。JSON.stringify
+  // 会静默丢键，但宿主 ToolRuntime 的 lossless JSON 校验检查 JS 对象本身，
+  // 遇到 undefined 值直接判 INVALID_TOOL_OUTPUT。条件键必须用条件展开。
   return task.acceptance.map((item) => ({
     id: item.id,
     text: item.text,
     source: item.source,
     kind: item.kind,
     active: item.active,
+    ...(item.protected === true ? { protected: true } : {}),
     covered: item.active ? passed.has(item.id) : null,
   }));
 }
@@ -518,9 +759,10 @@ export function createEngine(store) {
         });
       }
     }
-    const acceptance = args.acceptance === undefined
-      ? []
-      : normalizeAcceptance(optionalArray(args, 'acceptance') ?? []);
+    const acceptanceResult = args.acceptance === undefined
+      ? { items: [], confirmations: [], warnings: [] }
+      : normalizeAcceptance(optionalArray(args, 'acceptance') ?? [], [], [], ctx, state);
+    const acceptance = acceptanceResult.items;
     const at = nowIso();
     const task = {
       id: id(),
@@ -534,6 +776,7 @@ export function createEngine(store) {
       implementationStatus: 'unknown',
       reviewStatus: 'unverified',
       acceptance,
+      confirmationHistory: acceptanceResult.confirmations.map((entry) => ({ ...entry })),
       needs: [],
       verificationHistory: [],
       corrections: [],
@@ -548,11 +791,17 @@ export function createEngine(store) {
     };
     pushEvent(task, 'start', clip(goal, 200), at);
     state.tasks.push(task);
+    // start 用 acceptanceResult.confirmations 写 confirmationHistory；
+    // 清空 ctx 临时通道，避免同一 ctx 后续调用把 protect 授权重复写入。
+    if (Array.isArray(ctx.__consumedConfirmations)) ctx.__consumedConfirmations.length = 0;
     const warnings = [];
     if (acceptance.length === 0) {
       warnings.push('尚未登记验收项；没有活跃验收项时不能 close(done)');
     }
-    return ok({ task_id: task.id, task: summarizeTask(task), acceptance: acceptanceView(task) }, warnings);
+    return ok({ task_id: task.id, task: summarizeTask(task), acceptance: acceptanceView(task) }, [
+      ...acceptanceResult.warnings,
+      ...warnings,
+    ]);
   }
 
   function need(ctx, state, args) {
@@ -616,7 +865,8 @@ export function createEngine(store) {
     const task = ensureOpen(findTask(state, requiredString(args, 'task_id', 80)));
     const rawNeeds = optionalArray(args, 'needs');
     const rawAcceptance = optionalArray(args, 'acceptance');
-    if (!rawNeeds?.length && !rawAcceptance?.length) {
+    // acceptance: [] 是显式的"删除全部验收项"，也是合法变更（受保护项删除仍需授权）。
+    if (rawNeeds === undefined && rawAcceptance === undefined) {
       throw new PraxisError('missing-field', 'inventory 至少需要 needs 或 acceptance 之一', {
         hint: '批量补充调查结论或验收项',
       });
@@ -674,7 +924,8 @@ export function createEngine(store) {
     }
     if (rawAcceptance) {
       const before = task.acceptance;
-      const after = normalizeAcceptance(rawAcceptance, before);
+      const afterResult = normalizeAcceptance(rawAcceptance, before, warnings, ctx, state);
+      const after = afterResult.items;
       const changes = acceptanceChanges(before, after);
       if (changes.length > 0) {
         if (!changeReason) {
@@ -686,6 +937,16 @@ export function createEngine(store) {
         changed = true;
         pushEvent(task, 'advance', `验收项变更：${clip(JSON.stringify(changes), 240)}`, at);
       }
+    }
+    // M1：受保护项修改已当场核销用户确认，把授权记录写进任务审计历史（criterion-3）。
+    if (Array.isArray(ctx.__consumedConfirmations) && ctx.__consumedConfirmations.length > 0) {
+      task.confirmationHistory = Array.isArray(task.confirmationHistory) ? task.confirmationHistory : [];
+      for (const entry of ctx.__consumedConfirmations) {
+        task.confirmationHistory.push(entry);
+        pushEvent(task, 'advance', `受保护验收项 ${entry.criterionId} 变更已获用户授权（${entry.callId}，${entry.change}）`, at);
+      }
+      ctx.__consumedConfirmations.length = 0;
+      changed = true;
     }
     if (changed && task.phase === 'implement') {
       task.revision += 1;
@@ -1109,12 +1370,14 @@ export function createEngine(store) {
       at: item.at,
       coverage: item.coverage,
     }));
-    const { blockers, uncovered } = readinessOf(task);
+    const { blockers, codes, uncovered } = readinessOf(task);
     return ok({
       task: summarizeTask(task),
       acceptance: acceptanceView(task),
       uncovered,
       blockers,
+      blockerCodes: codes,
+      confirmationHistory: Array.isArray(task.confirmationHistory) ? task.confirmationHistory : [],
       needs: task.needs,
       corrections: task.corrections,
       pendingChangeIds: task.pendingChangeIds,
