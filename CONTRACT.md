@@ -1,6 +1,6 @@
 # Praxis v0.2.1 实现契约（内部，供并行开发对齐）
 
-> 当前实现版本 1.0.1（测试版）。本文保留 v0.2.1 基线，并已并入 v0.2.3（summary）、v1.0（提示通道、implRevision、dataDir）与 v1.0.1（提示按会话隔离、触发分类与闭环门槛收紧）的行为。
+> 当前实现版本 1.1.0-beta.1（测试版）。本文保留 v0.2.1 基线，并已并入 v0.2.3（summary）、v1.0（提示通道、implRevision、dataDir）、v1.0.1（提示按会话隔离、触发分类与闭环门槛收紧）与 v1.1（调查粒度软引导、受保护验收项的用户确认绑定）的行为。
 
 依据 `Praxis-DESIGN-v0.2.1.md`。纯 ESM JS（Node >= 20，无第三方依赖）。模块之间只 import 本目录模块或 node 内置；`lifecycle.js` 复用 `engine.js` 导出的 `readinessOf`，`engine.js` 不反向依赖 `lifecycle.js`。
 
@@ -24,6 +24,7 @@ const emptyState = () => ({
   observations: [],
   requests: [],
   lessons: [],
+  confirmations: [], // v1.1：宿主 user-question-reply 授权记录（trust.js 维护，容量 MAX_CONFIRMATIONS=500，优先驱逐已消费项）
   sessions: {},   // 宿主会话诊断（非契约核心）：{ lastReminderTurn, reminderCount, turnStops }
 });
 ```
@@ -161,7 +162,25 @@ export function readinessOf(task, implementationStatus = task.implementationStat
 // → { blockers: string[], codes: string[], uncovered: string[], manual: string[] }
 ```
 
-`close(done)` 与生命周期提醒共用这一份门槛。`codes` 是稳定类别（`phase`、`implementation`、`no-acceptance`、`manual`、`pending`、`uncovered`、`stale`），供提醒去重；`blockers` 是给人看的文本。生命周期用 `implementationStatus='complete'` 预演“如果按 complete 结项”，close 在写入入参状态后使用任务上的真实值。
+`close(done)` 与生命周期提醒共用这一份门槛。`codes` 是稳定类别（`phase`、`implementation`、`no-acceptance`、`manual`、`pending`、`uncovered`、`stale`、`protected-deactivated`），供提醒去重；`blockers` 是给人看的文本。生命周期用 `implementationStatus='complete'` 预演“如果按 complete 结项”，close 在写入入参状态后使用任务上的真实值。
+
+`protected-deactivated`（v1.1）：受保护验收项（`protected: true`）处于 `active: false`，但任务 `confirmationHistory` 里没有对应的授权记录（`criterionId` 匹配且 `change` ∈ `deactivate/replace/delete`）时阻断——不能通过停用受保护项绕过 done。
+
+## 7.2 `src/trust.js`（v1.1 用户确认绑定）
+
+```js
+export function extractConfirmation(event)          // 解析宿主 user-question-reply 事件 → { callId, questions:[{id,question,options}], answers:[{id,selected,text}] } | null
+export function recordConfirmation(state, sid, confirmation)  // 幂等 (sessionId,callId)；MAX_CONFIRMATIONS=500
+export function findUsableConfirmation(state, sid, callId)    // 同会话 + 未消费
+export function consumeConfirmation(state, record, usedBy)    // 原子消费（写入 consumedBy/consumedAt）
+export function confirmationDigest(record)                    // sha256 前 32 位
+export function attachTrust(ctx, store)                        // ctx.on('session/event', {global:true}) 监听并落账；trust 不可用时安全降级 no-op
+```
+
+- 信任锚点：只有宿主 `createUserMessage` 生成的 `user-question-reply`（`outcome: 'answered'`）算授权；模型自报字段、工具许可、历史 `source` 不算。cancelled / 部分回答不落账。
+- 消费核对在 `engine.js` 的 `requireProtectedConfirmation`：`callId` 优先取验收项自带 `confirmation_call_id`；回答必须语义肯定（`isAffirmativeAnswer`：options 与肯定选项精确等值；无 options 退肯定/否定词表**等值**匹配，否定优先拒绝）；变更内容与用户确认文本**完整等值匹配**（`extractConfirmedText`，不接受子串偏移）；同一会话；一次性消费。
+- 消费成功写入任务 `confirmationHistory: [{criterionId, callId, change, at}]`；`normalizeAcceptance` 对自报 `user_explicit` 无确认降级 `agent_proposed`+warning，`protected` 无确认拒绝（`confirmation-required`）。
+- 边界：确认无过期时间窗；直接改写 `state.json` 的伪造属宿主文件权限威胁，超出插件机制范围；未走确认链的首次登记只能是 `agent_proposed`（首次登记完整性无法由插件保证）。
 
 
 
@@ -191,6 +210,7 @@ v0.2.3 增补：只读动作 `summary` 提供跨任务聚合（`tasks.byPhase`/`
 - `test/observer.test.js`（队友 B）：缺身份不记录、去重、唯一活动任务归属、confirmed 使验证失效、possible 进 pending、容量不删被引用。
 - `test/lifecycle.test.js`（队友 C）：适用性分类（只读/讨论/疑问/执行序列/冒号指令/只读口令/多消息最后意图）、agent/created 的 scoped 上下文注册与父子隔离、同 id 重建、热加载补注册、pre-step 每轮只提示一次、通用/经验/闭环去重、闭环缺口与真实 `readinessOf`/`close(done)` 一致、只读不催收尾、section 注册、钩子缺失降级。
 - `test/engine.test.js`、`test/lesson.test.js`、`test/plugin.test.js`（Lead）：A/B/D/E 组契约与工具 schema 装配。
+- `test/trust.test.js`（v1.1）：确认提取（answered/cancelled/畸形 spell）、记录幂等与容量驱逐、受保护项建立/修订/停用的授权核对与降级、重放/跨会话/跨任务拒绝、肯定语义判断（options 精确等值/词表等值/否定拒绝）、完整变更匹配（子串偏移拒绝）、attachTrust 安全降级。
 
 ## 11. 硬性禁止
 

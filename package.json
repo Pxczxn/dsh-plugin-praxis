@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-praxis",
-  "version": "1.0.1",
+  "version": "1.1.0-beta.1",
   "description": "praxis: engineering discipline for DSH agents. Evidence-backed reuse/extend/new decisions, gated verification, and a searchable, correctable lesson book.",
   "type": "module",
   "main": "index.js",

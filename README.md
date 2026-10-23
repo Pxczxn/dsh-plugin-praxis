@@ -56,6 +56,15 @@ Praxis 给 DSH 加上一套**任务台账**与**可检索的错题本**：它不
 - `close(done)` 要求：阶段已在 `verify`、`implementationStatus=complete`、没有待复核的写入、当前 revision 的每条活跃验收项都有 `passed` 覆盖，且验证之后没有新的确认写入。
 - 等待人工验收用 `close(partial)` + `implementationStatus=complete` + `closureReason=awaiting_manual`。
 
+### 受保护验收项（v1.1 用户确认绑定）
+
+验收项可标记 `protected: true`，其建立、修订、升级保护与停用都必须绑定一次**真实用户确认**：
+
+- `source: user_explicit` 与 `protected: true` 都需要 `confirmation_call_id`——即 timed `ask_user_question` 超时 pending 后，用户通过宿主回答产生的 `user-question-reply` 消息。模型自报的 `user_explicit` 没有确认会被降级为 `agent_proposed` 并给出 warning；缺确认的 `protected` 项直接拒绝（`confirmation-required`）。
+- 授权核对的依据只来自宿主生成的会话事件（用户实际回答了什么），不信任模型转述：回答必须语义肯定（选项精确匹配提问给出的肯定选项；提问无选项时按肯定/否定词表**等值**匹配，选了否定词或空选择一律拒绝）、覆盖被确认的完整变更内容（等值提取，不接受子串偏移）、同一会话、且一次性消费（重放/跨会话/跨任务复用均拒绝）。
+- 每次授权消费都写入任务 `confirmationHistory`，可在 `status` 中审计。
+- 边界：确认没有过期时间窗（一次性消费 + 完整内容绑定缓解）；能直接改写 `state.json` 的进程伪造属宿主文件权限威胁，超出插件机制范围。没有走过确认链的验收项（包括用户口头提出但未 timed ask 确认的）只能是 `agent_proposed`——**首次登记完整性无法由插件保证**，信任锚点是 timed ask 确认链。
+
 ### 调查粒度（阶段 A 软引导）
 
 - `need` 记录的是调查后的结论，不是待调查清单。没有结论时先调查，不要先填 `reuse`/`extend`/`new` 占位，也不要为数量或形式完整而登记；弱证据只表示还没查完。
@@ -128,4 +137,4 @@ npm test          # node --test，全部用例
 npm run check     # 对每个源文件做 node --check
 ```
 
-模块划分：`src/evidence.js`（证据分级、相似度、相关性）、`src/store.js`（原子存储与锁）、`src/engine.js`（任务与经验规则）、`src/tools.js`（工具 schema 与处理器）、`src/observer.js` + `src/classify.js`（工具观察与写入影响分级）、`src/lifecycle.js`（指引段落与提醒）、`src/context.js`（会话/项目上下文）。
+模块划分：`src/evidence.js`（证据分级、相似度、相关性）、`src/store.js`（原子存储与锁）、`src/engine.js`（任务与经验规则）、`src/trust.js`（用户确认提取与授权消费）、`src/tools.js`（工具 schema 与处理器）、`src/observer.js` + `src/classify.js`（工具观察与写入影响分级）、`src/lifecycle.js`（指引段落与提醒）、`src/context.js`（会话/项目上下文）。
