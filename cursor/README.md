@@ -20,7 +20,17 @@ Cursor 没有 DSH 的宿主确认链，因此验收项不要标 `protected: true
 
 需要 Node.js ≥ 20，以及支持本地插件的 Cursor（插件目录为 `~/.cursor/plugins/local`）。
 
-在仓库根执行：
+**一键安装**：把下面这段话复制发给 Cursor，让 Agent 替你完成安装：
+
+```text
+帮我一键安装 Praxis 的 Cursor 插件（cursor-plugin-praxis）：
+1. 若本机还没有克隆 https://github.com/Pxczxn/dsh-plugin-praxis，先克隆到本地；已有克隆则进入该仓库并 git pull 更新 main；
+2. 确认 Node.js ≥ 20；
+3. 在仓库根目录按当前系统运行安装脚本：Windows 用 pwsh -File cursor/scripts/install.ps1（没有 pwsh 时 powershell -File 也可以），macOS / Linux 用 sh cursor/scripts/install.sh；
+4. 脚本会把插件复制到 ~/.cursor/plugins/local/praxis。装好后提醒我：需要重启 Cursor 或执行 Developer: Reload Window 才生效，praxis 的 MCP 首次调用需要手动批准。
+```
+
+也可以手动在仓库根执行：
 
 ```powershell
 pwsh -File cursor/scripts/install.ps1
