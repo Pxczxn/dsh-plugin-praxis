@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{ "command": "node hooks/session-start.mjs", "timeout": 15 }],
+    "sessionEnd": [{ "command": "node hooks/session-end.mjs", "timeout": 15 }],
+    "beforeSubmitPrompt": [{ "command": "node hooks/before-submit-prompt.mjs", "timeout": 15 }],
+    "postToolUse": [{ "command": "node hooks/post-tool-use.mjs", "timeout": 20 }],
+    "postToolUseFailure": [{ "command": "node hooks/post-tool-use-failure.mjs", "timeout": 20 }],
+    "afterFileEdit": [{ "command": "node hooks/after-file-edit.mjs", "timeout": 20 }],
+    "stop": [
+      {
+        "command": "node -e \"const{pathToFileURL}=require('node:url');const p=process.env.CURSOR_PLUGIN_ROOT||process.cwd();import(pathToFileURL(p+'/hooks/stop.mjs').href)\"",
+        "timeout": 20,
+        "loop_limit": 1
+      }
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+---
+description: Praxis 工程纪律：先调查再动手，非平凡改动记账，完成声明必须有验证证据。
+alwaysApply: true
+---
+
+# Praxis 工程纪律
+
+- 只读、问答、规划、讨论轮次不建任务、不改代码；用户说「只读 / 不要改 / 先别改」时以只读处理。
+- 非平凡代码改动（多文件、重构、修 bug、改行为、新增能力）先用 `praxis_task` 的 `start` 建任务；调查完成后再用 `need` 记录 `reuse` / `extend` / `new` 与具体证据（文件:行号、命令+输出）。没有结论时不要先填 decision 占位。
+- 实现改动会让旧验证失效。完成前必须重跑覆盖全部活跃验收项的检查，并用 `verify` 把结果映射到验收项。
+- `verify` 的 `passed` 只能引用 `status` 列出的、成功执行的 `test` / `build` / `lint` 观察 ID。「我试过了」「应该可以」不算证据。
+- `close(done)` 要求：阶段在 `verify`、`implementationStatus=complete`、没有待复核写入、当前 revision 覆盖全部活跃验收项。等待人工验收用 `close(partial, complete, awaiting_manual)`。
+- Cursor 没有宿主确认链：验收项不要标 `protected: true`，也不要用 `source: user_explicit`；需要人工确认的项用 `kind: manual` + `agent_proposed`。
+- 经验检索优先：相关任务开始时先 `praxis_lesson` `search`；保存/修订必须给具体证据，退役要给 `reason`。检索结果是调查线索，不是当前事实。

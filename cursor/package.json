@@ -1,0 +1,17 @@
+{
+  "name": "cursor-plugin-praxis",
+  "version": "1.1.0-beta.1",
+  "private": true,
+  "type": "module",
+  "description": "Praxis for Cursor: MCP task ledger + hooks + skill + rule.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "sync": "node scripts/sync-core.mjs",
+    "test": "node scripts/sync-core.mjs && node --test",
+    "check": "node --check server/index.js && node --check server/session.mjs && node --check server/context.mjs && node --check server/workspace.mjs && node --check hooks/lib.mjs && node --check hooks/session-start.mjs && node --check hooks/session-end.mjs && node --check hooks/before-submit-prompt.mjs && node --check hooks/post-tool-use.mjs && node --check hooks/post-tool-use-failure.mjs && node --check hooks/after-file-edit.mjs && node --check hooks/stop.mjs && node --check scripts/link.mjs && node --check scripts/sync-core.mjs",
+    "link": "node scripts/link.mjs install",
+    "unlink": "node scripts/link.mjs uninstall"
+  }
+}

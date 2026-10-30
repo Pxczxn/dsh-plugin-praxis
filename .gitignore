@@ -4,3 +4,6 @@ node_modules/
 test-results/
 .DS_Store
 Thumbs.db
+
+# Cursor 插件的引擎源码由 dsh/src 生成，不提交
+cursor/server/core/
