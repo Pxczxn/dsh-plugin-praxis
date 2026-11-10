@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-praxis",
-  "version": "1.1.0-beta.1",
+  "version": "1.1.0-beta.2",
   "description": "praxis: engineering discipline for DSH agents. Evidence-backed reuse/extend/new decisions, gated verification, and a searchable, correctable lesson book.",
   "type": "module",
   "main": "index.js",
@@ -16,11 +16,12 @@
   ],
   "engines": {
     "node": ">=20",
-    "dsh": ">=0.1.0-rc.6"
+    "dsh": ">=0.2.1-rc.2"
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check index.js && node --check src/evidence.js && node --check src/store.js && node --check src/engine.js && node --check src/trust.js && node --check src/tools.js && node --check src/observer.js && node --check src/classify.js && node --check src/lifecycle.js && node --check src/context.js"
+    "check": "node --check index.js && node --check src/evidence.js && node --check src/store.js && node --check src/engine.js && node --check src/trust.js && node --check src/tools.js && node --check src/observer.js && node --check src/classify.js && node --check src/lifecycle.js && node --check src/context.js && node --check scripts/check-host.mjs",
+    "check:host": "node scripts/check-host.mjs"
   },
   "dsh": {
     "bundle": {
@@ -28,6 +29,6 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "*"
+    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.2"
   }
 }

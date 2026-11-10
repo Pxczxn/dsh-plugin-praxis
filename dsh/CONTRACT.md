@@ -1,6 +1,8 @@
 # Praxis v0.2.1 实现契约（内部，供并行开发对齐）
 
-> 当前实现版本 1.1.0-beta.1（测试版）。本文保留 v0.2.1 基线，并已并入 v0.2.3（summary）、v1.0（提示通道、implRevision、dataDir）、v1.0.1（提示按会话隔离、触发分类与闭环门槛收紧）与 v1.1（调查粒度软引导、受保护验收项的用户确认绑定）的行为。
+> 当前实现版本 1.1.0-beta.2（测试版）。本文保留 v0.2.1 基线，并已并入 v0.2.3（summary）、v1.0（提示通道、implRevision、dataDir）、v1.0.1（提示按会话隔离、触发分类与闭环门槛收紧）与 v1.1（调查粒度软引导、受保护验收项的用户确认绑定）的行为。
+>
+> 宿主基线：`engines.dsh >= 0.2.1-rc.2`，`@deepseek-ai/dsh-tools >= 0.2.1-rc.2`。本机 0.2.2-rc.1 上 17 条宿主接缝已逐条核对（对照表与运行态旁证见 `docs/host-compat.md`），复核入口是 `npm run check:host`。宿主升级后先跑检查、再决定改插件还是抬下限，不要把"下限放行"当成"更高版本适配"。
 
 依据 `Praxis-DESIGN-v0.2.1.md`。纯 ESM JS（Node >= 20，无第三方依赖）。模块之间只 import 本目录模块或 node 内置；`lifecycle.js` 复用 `engine.js` 导出的 `readinessOf`，`engine.js` 不反向依赖 `lifecycle.js`。
 
@@ -145,6 +147,7 @@ export function classifyRequest(text)       // 'applicable' | 'not_applicable' |
 - `ctx.on('agent/turn-stopping', async (payload) => {...})`：`observe` 模式，只记录诊断（`closureHint { taskId, pending, detail, codes, phase }`、`turnStops`），不发消息、不续步；诊断对象取本会话最近更新的 open 任务；无 open 任务时清空 `closureHint` 与 `lastClosureSignature`。
 - `closureGaps(task, state)` 复用 `readinessOf(task, 'complete')`：phase、implementationStatus、活跃验收项、人工验收项、待复核写入、当前 revision 的覆盖、stale 验证都与 `close(done)` 同源；缺口是 `uncovered`/`stale` 时附加最近可用证据 ID。
 - `classifyRequest`：只读/规划/讨论/疑问优先；明确执行指令（`帮我修复`、`检查一下：优化…`、`整理一下然后修复`）仍适用；英文动作词按 `\b` 匹配（`prefix`/`fixture` 不算 `fix`）；斜杠只识别 `/help` 这类命令，不把绝对路径当命令。
+- 疑问框架只在**主句**上判：逗号/分号后由 `检查/核对/确认/核实/验证/看看…` 引出、且带 `是否/有没有/能否/能不能` 的从句先剔除再判 speculative —— 「根据本机的 DSH 版本更新插件，检查是否适配」是改动请求；没有前置标点的同类从句（`帮我看看是否要改成异步`、`检查一下是否适配`）仍按只读处理。
 - 会话与项目上下文由 `sessionContext` 提供；子代理会话的 `projectKey` 为空。
 - 任一钩子接线抛错 → 返回 degraded 标识（`system-prompt`、`prompt-context`、`agent-scope`、`hooks`），不吞错假装启用。
 
