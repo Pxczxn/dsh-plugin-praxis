@@ -254,6 +254,16 @@ test('请求分类只对改动意图判定为适用', () => {
   assert.equal(classifyRequest('analyze and then fix the bug'), 'applicable');
   assert.equal(classifyRequest('can we optimize this loop?'), 'not_applicable');
   assert.equal(classifyRequest('review src/lifecycle.js'), 'not_applicable');
+  // 「…更新吧，检查是否适配」：逗号后「检查/确认是否…」是受检内容，不是主句提问，
+  // 不能被从句里的「是否」判成讨论；主句仍是明确的改动请求。
+  assert.equal(classifyRequest('根据本机的dsh版本进行更新吧，检查是否适配'), 'applicable');
+  assert.equal(classifyRequest('按本机 DSH 版本更新插件，检查是否适配'), 'applicable');
+  assert.equal(classifyRequest('先改一下这个函数，然后再检查是否通过'), 'applicable');
+  assert.equal(classifyRequest('更新 README，确认有没有漏掉的说明'), 'applicable');
+  // 但受检从句必须带前置标点：句首的「看看是否…」仍然是提问，不能翻成动手。
+  assert.equal(classifyRequest('帮我看看是否要改成异步'), 'not_applicable');
+  assert.equal(classifyRequest('检查一下是否适配'), 'not_applicable');
+  assert.equal(classifyRequest('根据文档说明一下这个机制，检查是否准确'), 'not_applicable');
 });
 
 test('通用提醒是条件式的，误触发时也不断言本轮一定有代码改动', () => {

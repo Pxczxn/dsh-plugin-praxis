@@ -75,6 +75,12 @@ const EXPLICIT_IMPERATIVE =
 // 疑问、建议、思路类框架：出现时按说明类请求处理，除非同时出现执行序列或任务结构。
 const SPECULATIVE =
   /(如何|怎么|怎样|为什么|为何|能不能|可不可以|能否|要不要|该不该|是否|有没有|值不值得|建议|思路|是什么|怎么理解|有什么区别|可行性|利弊|取舍|优缺点|多久|多长时间|工期|工作量|思考|can we|could we|should we|would it|how to|how can|is it possible|do we need|what is|why does|difference between|suggest(?:ion)?|approach|trade-?off)/iu;
+// 「根据本机的 DSH 版本进行更新吧，检查是否适配」：这里的「是否」是**受检内容**，
+// 不是主句在提问。逗号/分号后面由 检查/确认/看看… 引出、且带 是否/能不能… 的从句
+// 在判疑问语气前先剔掉，否则整句会被从句里的疑问词判成讨论。
+// 只认带前置标点的从句：「帮我看看是否要改成异步」仍然是提问，不能被翻成动手。
+const INSPECTION_CLAUSE =
+  /[，,、；;]\s*(?:(?:再|然后|接着|顺便|并|也|还)\s*){0,2}(?:检查|核对|确认|核实|验证|查一下|看下|看看|试一下)[^，。；;,.!?！？\n]{0,40}?(?:是否|有没有|能否|能不能|可不可以|要不要)/gu;
 // 任务说明结构：出现时说明这是一份执行要求，而不是随口问问。
 const TASK_STRUCTURE =
   /(\*\*目标\*\*|(^|[\s，。；;])目标[:：]|验收|(^|[\s，。；;])要求[:：]|(^|[\s，；;])约束[:：]|完成标准|需要你|请你在|务必|必须)/u;
@@ -109,7 +115,9 @@ export function classifyRequest(text) {
   const hasWeak = WEAK_VERBS.some((verb) => raw.includes(verb));
   const hasQuestion = QUESTION_MARKERS.some((marker) => raw.toLowerCase().includes(marker.toLowerCase()));
   const hasCode = CODE_MARKERS.some((marker) => raw.toLowerCase().includes(marker.toLowerCase()));
-  const speculative = SPECULATIVE.test(raw);
+  // 受检从句里的疑问词不属于主句提问：先剔掉再判语气，再交给下面的分支。
+  const intentText = raw.replace(INSPECTION_CLAUSE, '，');
+  const speculative = SPECULATIVE.test(intentText);
   const execution = EXECUTION_SEQUENCE.test(raw);
   const taskStructure = TASK_STRUCTURE.test(raw);
 
